@@ -1,0 +1,9 @@
+{
+  "name": "video-script-extract",
+  "version": "1.0.0",
+  "description": "Local web app to extract transcripts from video URLs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
