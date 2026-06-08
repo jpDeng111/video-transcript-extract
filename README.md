@@ -1,69 +1,72 @@
-# 视频内容提取 Web 应用
+# Quittr Dashboard
 
-本项目是一个仅供本机使用的 Web 小工具：输入 YouTube、Bilibili 等视频链接，自动下载视频并调用阿里云百炼 `qwen3.6-plus` 提取其中的口播、对白、旁白与字幕内容，整理成可复制文本。
+这是一个本地运行的 Quittr 恢复进度 Dashboard 原型，用于展示戒断进度、打卡承诺、统计分析、资料库、个人页和 Melius 聊天界面。
 
-## 当前方案
+## 技术栈
 
-- 前端：原生 HTML/CSS/JS
+- 前端：原生 HTML/CSS/JS + React 18 UMD
 - 后端：原生 Node.js `http` 服务
-- 视频下载：`yt-dlp`
-- 视频处理：`ffmpeg` / `ffprobe`
-- 视频理解：阿里云百炼 `qwen3.6-plus`
+- 数据存储：本地 JSON 文件
 
 ## 本地启动
 
-1. 复制环境变量文件：
-
-```bash
-cp .env.example .env
-```
-
-2. 编辑 `.env`，填入：
-
-```env
-DASHSCOPE_API_KEY=你的百炼 API Key
-DASHSCOPE_BASE_URL=https://coding.dashscope.aliyuncs.com/v1
-PORT=3000
-```
-
-3. 安装依赖工具：
-
-- `yt-dlp`
-- `ffmpeg`（需包含 `ffprobe`）
-
-如果你用 Homebrew，可执行：
-
-```bash
-brew install yt-dlp ffmpeg
-```
-
-4. 启动服务：
+### 1. 启动服务
 
 ```bash
 npm start
 ```
 
-5. 打开浏览器访问：
+### 2. 打开页面
 
 ```text
 http://localhost:3000
 ```
 
-## 说明
+项目没有 npm 运行时依赖，`package.json` 目前只定义了 `npm start`。
 
-- 项目默认会把长视频切成 4 分钟一段，逐段发送给模型后拼接结果。
-- 每个视频链接会对应一个 `jobs/<hash>/` 目录，里面保存 `transcript.txt`、`checkpoint.json`、分段视频和每段结果。
-- 处理长视频时，每个 chunk 完成后会立刻写入 `transcript.txt`；如果中途失败，再次提交同一个链接会跳过已完成 chunk，从断点继续。
-- `results/chunk-xxx.txt` 是最重要的断点数据：只有某段模型返回成功后才会写入该文件。
-- `checkpoint.json` 会记录当前阶段、总 chunk 数、已完成 chunk 数、当前正在处理的 chunk 和最近错误。
-- `chunks-manifest.json` 用来确认分片是否完整；如果切分阶段中断，下次会重新切分视频，但不会删除已经完成的 `results/chunk-xxx.txt`。
-- `transcript.txt` 每次由已完成的 chunk 重新拼接并原子写入，因此即使浏览器断开，也能保留已经完成的文字。
-- 你的 API Key 只在本地服务端使用，不会暴露到前端页面。
-- 如果你使用的是百炼 `Coding Plan` 专属 Key，网关应使用 `https://coding.dashscope.aliyuncs.com/v1`。
-- 如果 YouTube 访问依赖 VPN，请先确保本机终端环境也能正常访问。
-- 这不是专门的 ASR 语音识别方案，而是基于视频理解模型尽量还原视频中的文字内容，准确率会受画面、字幕、口播清晰度影响。
+## 当前功能
 
-## 重要说明
+- 首页恢复进度、里程碑、快捷操作和功能卡片
+- Pledge 弹窗与完成动画
+- Analytics 页面，展示当前 streak、历史 reset、趋势图和统计指标
+- Reset 按钮会写入一次 relapse 记录，并刷新统计数据
+- Library 页面，包含声音场景、课程、游戏和排行榜原型
+- Profile 页面，展示徽章、成就和帖子原型
+- Melius 聊天页，目前只保留本地临时消息，不保存历史
+- 底部导航，可在 Home、Chat、Stats、Library 和 Profile 之间切换
 
-由于你当前的 Key 只能使用 `qwen3.6-plus`，本项目实现改为“视频输入理解”方案，而不是专门的音频 ASR 方案。
-# quittr-copy
+## API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/` | Quittr Dashboard 页面 |
+| `GET` | `/api/quittr/analytics` | 获取恢复统计数据 |
+| `POST` | `/api/quittr/relapses` | 记录一次 relapse/reset 并返回新统计 |
+
+## 本地数据
+
+```text
+.
+├── data/
+│   └── quittr-state.json
+├── public/
+│   ├── app.js
+│   ├── index.html
+│   └── styles.css
+├── server.js
+└── package.json
+```
+
+- `data/quittr-state.json` 保存 Quittr 的开始时间和 relapse 记录。
+- 如果数据文件不存在，服务端会自动创建一份默认状态。
+- Melius 聊天消息只保存在当前浏览器会话中，刷新页面后会清空。
+
+## 注意事项
+
+- 推荐使用 Node.js 18 或更高版本。
+- 页面通过 CDN 加载 React 18，浏览器需要能访问 `unpkg.com`。
+- 当前没有自动化测试脚本。
+
+## License
+
+License information has not been specified yet.
