@@ -1,18 +1,84 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Quittr Dashboard</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/styles.css?v=20260531a">
+    <title>B 站视频转写问答</title>
+    <link rel="stylesheet" href="/styles.css?v=bili-audio-qa-20260629">
   </head>
   <body>
-    <div id="root"></div>
-    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="/app.js?v=20260531a"></script>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Bilibili video transcript QA</p>
+        <h1>B 站视频转写问答</h1>
+        <p class="lede">输入 B 站视频链接，本地提取视频并按段转写。文稿生成后，可以直接围绕视频内容提问。</p>
+      </section>
+
+      <section class="workspace" aria-label="视频处理工作台">
+        <form class="panel input-panel" data-form>
+          <label for="video-url">B 站视频链接</label>
+          <div class="input-row">
+            <input id="video-url" data-url type="url" placeholder="https://www.bilibili.com/video/BV..." required>
+            <button data-submit type="submit">提取并转写</button>
+          </div>
+          <button class="secondary-button" data-check-status type="button">读取本地进度</button>
+          <p class="hint">视频、分段和文稿会保存在项目的 <code>jobs/&lt;hash&gt;/</code> 目录下。</p>
+        </form>
+
+        <section class="panel status-panel" aria-label="处理状态">
+          <div class="status-row">
+            <span data-status>等待提交视频链接。</span>
+            <span class="status-dot" aria-hidden="true"></span>
+          </div>
+          <div class="progress" role="progressbar" aria-label="处理进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <span data-progress></span>
+          </div>
+          <dl class="job-summary" data-job-summary>
+            <div>
+              <dt>已完成</dt>
+              <dd data-summary-completed>0/0</dd>
+            </div>
+            <div>
+              <dt>下次继续</dt>
+              <dd data-summary-next>尚未开始</dd>
+            </div>
+            <div>
+              <dt>任务状态</dt>
+              <dd data-summary-status>等待</dd>
+            </div>
+          </dl>
+          <p class="path-line">本地结果：<span data-transcript-path>尚未生成</span></p>
+        </section>
+
+        <section class="panel transcript-panel" aria-label="已保存文稿">
+          <div class="panel-heading">
+            <h2>已保存文稿</h2>
+            <span>实时同步 transcript.txt</span>
+          </div>
+          <textarea data-transcript readonly placeholder="每完成一个视频分段，这里会显示已经写入本地的文字。"></textarea>
+        </section>
+
+        <section class="panel qa-panel" aria-label="文稿问答">
+          <form data-qa-form>
+            <div class="panel-heading">
+              <h2>文稿问答</h2>
+              <span>基于当前 transcript.txt</span>
+            </div>
+            <textarea data-question placeholder="例如：这期视频的核心观点是什么？" required></textarea>
+            <button data-ask type="submit">提问</button>
+          </form>
+          <div class="answer" data-answer>转写完成后，可以在这里提问。</div>
+        </section>
+
+        <section class="panel log-panel" aria-label="处理日志">
+          <div class="panel-heading">
+            <h2>处理日志</h2>
+            <span>最近 8 条</span>
+          </div>
+          <ol data-log></ol>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js?v=bili-audio-qa-20260629"></script>
   </body>
 </html>
