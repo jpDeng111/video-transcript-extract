@@ -26,6 +26,39 @@ fs.mkdirSync(JOBS_ROOT, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const PORT = Number(process.env.PORT || 3000);
 
+function detectPlatform(videoUrl) {
+  try {
+    const u = new URL(videoUrl);
+    const host = u.hostname.toLowerCase();
+    if (/bilibili\.com|b23\.tv|bili[a-z]*\.com/.test(host)) return "bilibili";
+    if (/youtube\.com|youtu\.be|googlevideo\.com/.test(host)) return "youtube";
+    if (/douyin\.com|tiktok\.com/.test(host)) return "douyin";
+    if (/xiaohongshu\.com|xhslink\.com/.test(host)) return "xiaohongshu";
+    if (/twitter\.com|x\.com/.test(host)) return "twitter";
+    return "generic";
+  } catch {
+    return "generic";
+  }
+}
+
+function getPlatformArgs(platform) {
+  switch (platform) {
+    case "bilibili":
+      return parseShellArgs(
+        "--no-update --cookies-from-browser chrome " +
+        "--user-agent Mozilla/5.0 " +
+        "--referer https://www.bilibili.com/ " +
+        "--add-headers Accept-Language:zh-CN,zh;q=0.9,en;q=0.8"
+      );
+    case "youtube":
+      return parseShellArgs("--cookies-from-browser chrome");
+    case "douyin":
+      return parseShellArgs("--cookies-from-browser chrome");
+    default:
+      return parseShellArgs("--cookies-from-browser chrome");
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -63,6 +96,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/job") {
       return handleJobStatus(url, res);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/download") {
+      return handleDownload(url, res);
     }
 
     if (req.method === "GET" && url.pathname === "/api/quittr/analytics") {
@@ -383,6 +420,7 @@ async function handleTranscribe(req, res) {
       id: job.id,
       sourceUrl: videoUrl,
       title: info.title,
+      uploader: info.uploader || "",
       asrModel: ASR_MODEL_NAME,
       chatModel: CHAT_MODEL_NAME,
       chunkSeconds: MAX_CHUNK_SECONDS,
@@ -615,6 +653,48 @@ function handleJobStatus(url, res) {
   return sendJson(res, 200, buildJobStatus(job));
 }
 
+function getPlatformLabel(videoUrl) {
+  const platform = detectPlatform(videoUrl);
+  const labels = {
+    bilibili: "bilibili",
+    youtube: "youtube",
+    douyin: "douyin",
+    xiaohongshu: "xiaohongshu",
+    twitter: "twitter"
+  };
+  return labels[platform] || "web";
+}
+
+function handleDownload(url, res) {
+  const sourceUrl = String(url.searchParams.get("url") || "").trim();
+  const jobId = String(url.searchParams.get("jobId") || "").trim();
+  const job = jobId ? getJobById(jobId) : sourceUrl ? createJob(sourceUrl) : null;
+
+  if (!job) {
+    return sendJson(res, 400, { error: "Please provide url or jobId." });
+  }
+
+  if (!fs.existsSync(job.transcriptPath)) {
+    return sendJson(res, 404, { error: "还没有转写结果。" });
+  }
+
+  const metadata = readJsonFile(job.metadataPath);
+  const title = (metadata && metadata.title) || "transcript";
+  const uploader = (metadata && metadata.uploader) || "";
+  const platform = getPlatformLabel((metadata && metadata.sourceUrl) || sourceUrl);
+  const parts = [title, uploader, platform].filter(Boolean);
+  const rawName = parts.join("-");
+  const safeName = rawName.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_").slice(0, 120);
+  const content = fs.readFileSync(job.transcriptPath, "utf-8");
+
+  res.writeHead(200, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Content-Disposition": `attachment; filename="${encodeURIComponent(safeName)}.txt"`,
+    "Access-Control-Allow-Origin": "*"
+  });
+  res.end(content);
+}
+
 async function prepareAudio(videoUrl, job, sendEvent) {
   const existingMetadata = readJsonFile(job.metadataPath);
   let existingSourcePath = findFirstFile(job.dir, /^source\.(m4a|mp3|webm|mp4|mkv|mov|m4v|wav|aac|opus)$/i);
@@ -626,7 +706,8 @@ async function prepareAudio(videoUrl, job, sendEvent) {
       message: "找到已有规范化音频，跳过下载。"
     });
     return {
-      title: existingMetadata.title || await fetchVideoTitle(videoUrl),
+      title: existingMetadata.title || (await fetchVideoInfo(videoUrl)).title,
+      uploader: existingMetadata.uploader || (await fetchVideoInfo(videoUrl)).uploader,
       sourcePath: existingSourcePath,
       audioPath: job.audioPath
     };
@@ -658,7 +739,7 @@ async function prepareAudio(videoUrl, job, sendEvent) {
     sendEvent({
       type: "status",
       step: "download",
-      message: "正在用 yt-dlp 提取 B 站音频..."
+      message: "正在用 yt-dlp 提取音频..."
     });
 
     await downloadAudioWithYtDlp(videoUrl, outputTemplate, job, sendEvent);
@@ -712,9 +793,10 @@ async function prepareAudio(videoUrl, job, sendEvent) {
   }
 
   fs.renameSync(normalizedTmpPath, job.audioPath);
-  const title = existingMetadata.title || await fetchVideoTitle(videoUrl);
+  const videoInfo = existingMetadata.title ? { title: existingMetadata.title, uploader: existingMetadata.uploader || "" } : await fetchVideoInfo(videoUrl);
   return {
-    title,
+    title: videoInfo.title,
+    uploader: videoInfo.uploader,
     sourcePath,
     audioPath: job.audioPath
   };
@@ -839,7 +921,8 @@ async function downloadVideo(videoUrl, job, sendEvent) {
       message: "Found existing normalized video, skipping download."
     });
     return {
-      title: existingMetadata.title || await fetchVideoTitle(videoUrl),
+      title: existingMetadata.title || (await fetchVideoInfo(videoUrl)).title,
+      uploader: existingMetadata.uploader || (await fetchVideoInfo(videoUrl)).uploader,
       sourcePath: existingSourcePath,
       videoPath: job.normalizedPath
     };
@@ -938,9 +1021,10 @@ async function downloadVideo(videoUrl, job, sendEvent) {
   }
 
   fs.renameSync(normalizedTmpPath, job.normalizedPath);
-  const title = existingMetadata.title || await fetchVideoTitle(videoUrl);
+  const videoInfo = existingMetadata.title ? { title: existingMetadata.title, uploader: existingMetadata.uploader || "" } : await fetchVideoInfo(videoUrl);
   return {
-    title,
+    title: videoInfo.title,
+    uploader: videoInfo.uploader,
     sourcePath,
     videoPath: job.normalizedPath
   };
@@ -1091,7 +1175,7 @@ async function downloadWithYtDlp(videoUrl, outputTemplate, job, sendEvent) {
     }
   }
 
-  throw new Error(formatYtDlpError(lastError));
+  throw new Error(formatYtDlpError(lastError, videoUrl));
 }
 
 async function downloadAudioWithYtDlp(videoUrl, outputTemplate, job, sendEvent) {
@@ -1124,10 +1208,13 @@ async function downloadAudioWithYtDlp(videoUrl, outputTemplate, job, sendEvent) 
     }
   }
 
-  throw new Error(formatYtDlpError(lastError));
+  throw new Error(formatYtDlpError(lastError, videoUrl));
 }
 
 function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
+  const platform = detectPlatform(videoUrl);
+  const platformArgs = getPlatformArgs(platform);
+
   const baseArgs = [
     "--no-playlist",
     "--retries",
@@ -1142,6 +1229,7 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
     "30",
     "--output",
     outputTemplate,
+    ...platformArgs,
     ...YTDLP_EXTRA_ARGS
   ];
 
@@ -1183,14 +1271,16 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
   }));
 }
 
-function formatYtDlpError(error) {
+function formatYtDlpError(error, videoUrl) {
   const message = getErrorMessage(error);
-  if (/HTTP Error 412|Precondition Failed/i.test(message)) {
+  const platform = detectPlatform(videoUrl || "");
+
+  if (platform === "bilibili" && /HTTP Error 412|Precondition Failed/i.test(message)) {
     return [
       "B 站拒绝了 yt-dlp 的网页请求：HTTP 412 Precondition Failed。",
       "这通常需要带上你本人浏览器里的 B 站登录 cookies。",
-      "优先尝试在 Chrome 登录 B 站后设置：YTDLP_EXTRA_ARGS=\"--no-update --cookies-from-browser chrome --user-agent Mozilla/5.0 --referer https://www.bilibili.com/ --add-headers Accept-Language:zh-CN,zh;q=0.9,en;q=0.8\"。",
-      "如果读取浏览器 cookies 失败，再导出 Netscape 格式 cookies.txt 放到项目根目录，并设置：YTDLP_EXTRA_ARGS=\"--no-update --cookies cookies.txt --user-agent Mozilla/5.0 --referer https://www.bilibili.com/ --add-headers Accept-Language:zh-CN,zh;q=0.9,en;q=0.8\"。",
+      "优先尝试在 Chrome 登录 B 站后设置：YTDLP_EXTRA_ARGS=\"--no-update --cookies-from-browser chrome --user-agent Mozilla/5.0 --referer https://www.bilibili.com/\"。",
+      "如果读取浏览器 cookies 失败，再导出 Netscape 格式 cookies.txt 放到项目根目录，并设置：YTDLP_EXTRA_ARGS=\"--no-update --cookies cookies.txt\"。",
       `原始错误：${message}`
     ].join("\n");
   }
@@ -1199,7 +1289,7 @@ function formatYtDlpError(error) {
     return [
       "yt-dlp 下载视频时 SSL 连接被中断。",
       "我已经自动尝试了普通下载、IPv4、legacy TLS 和跳过证书校验，但仍未成功。",
-      "这通常是 B 站连接、代理/VPN、证书链或网络运营商导致的。",
+      "这可能是网络连接、代理/VPN、证书链或平台反爬机制导致的。",
       "可以在 .env 里设置 YTDLP_EXTRA_ARGS，例如：YTDLP_EXTRA_ARGS=\"--proxy http://127.0.0.1:7890 --cookies-from-browser chrome\"。",
       `原始错误：${message}`
     ].join("\n");
@@ -1734,17 +1824,24 @@ async function isValidMediaFile(filePath) {
   }
 }
 
-async function fetchVideoTitle(videoUrl) {
+async function fetchVideoInfo(videoUrl) {
   try {
+    const platform = detectPlatform(videoUrl);
+    const platformArgs = getPlatformArgs(platform);
     const output = await runCommand("yt-dlp", [
       "--print",
-      "%(title)s",
+      "%(title)s\n%(uploader)s",
       "--no-playlist",
+      ...platformArgs,
       videoUrl
     ]);
-    return output.trim() || "Untitled Video";
+    const lines = output.trim().split("\n");
+    return {
+      title: lines[0] || "Untitled Video",
+      uploader: lines[1] || ""
+    };
   } catch {
-    return "Untitled Video";
+    return { title: "Untitled Video", uploader: "" };
   }
 }
 

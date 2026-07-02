@@ -194,6 +194,12 @@ button:hover:not(:disabled) {
   line-height: 1.6;
 }
 
+.heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .hint {
   margin: 14px 0 0;
 }

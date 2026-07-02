@@ -11,6 +11,7 @@ const questionInput = document.querySelector("[data-question]");
 const askButton = document.querySelector("[data-ask]");
 const answerOutput = document.querySelector("[data-answer]");
 const checkStatusButton = document.querySelector("[data-check-status]");
+const downloadButton = document.querySelector("[data-download]");
 const summaryCompleted = document.querySelector("[data-summary-completed]");
 const summaryNext = document.querySelector("[data-summary-next]");
 const summaryStatus = document.querySelector("[data-summary-status]");
@@ -119,6 +120,7 @@ function handleEvent(event) {
     setStatus("转写完成，结果已保存到本地。");
     addLog("全部视频分段已完成。");
     answerOutput.textContent = "现在可以基于这份文稿提问。";
+    downloadButton.disabled = false;
     loadJobStatus().catch(() => {});
   }
 
@@ -240,6 +242,10 @@ async function loadJobStatus() {
     transcriptOutput.value = data.transcriptPreview;
   }
 
+  if (data.completedChunks > 0 && data.completedChunks >= (data.totalChunks || 1)) {
+    downloadButton.disabled = false;
+  }
+
   const next = data.nextResumeChunkHuman ? `下次从第 ${data.nextResumeChunkHuman} 段继续` : "没有待处理片段";
   setStatus(`本地进度：${data.completedChunks}/${data.totalChunks || 0} 段，${next}。`);
   addLog(`读取本地进度：${data.completedChunks}/${data.totalChunks || 0} 段。`);
@@ -267,3 +273,14 @@ function setAskBusy(isBusy) {
   questionInput.disabled = isBusy;
   askButton.textContent = isBusy ? "思考中..." : "提问";
 }
+
+downloadButton.addEventListener("click", () => {
+  const url = urlInput.value.trim();
+  const params = new URLSearchParams();
+  if (activeJobId) {
+    params.set("jobId", activeJobId);
+  } else if (url) {
+    params.set("url", url);
+  }
+  window.location.href = `/api/download?${params.toString()}`;
+});

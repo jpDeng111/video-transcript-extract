@@ -3,22 +3,22 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>B 站视频转写问答</title>
+    <title>视频转写问答</title>
     <link rel="stylesheet" href="/styles.css?v=bili-audio-qa-20260629">
   </head>
   <body>
     <main class="shell">
       <section class="hero">
-        <p class="eyebrow">Bilibili video transcript QA</p>
-        <h1>B 站视频转写问答</h1>
-        <p class="lede">输入 B 站视频链接，本地提取视频并按段转写。文稿生成后，可以直接围绕视频内容提问。</p>
+        <p class="eyebrow">Video transcript QA</p>
+        <h1>视频转写问答</h1>
+        <p class="lede">输入视频链接（B 站、YouTube、抖音等），本地提取视频并按段转写。文稿生成后，可以直接围绕视频内容提问。</p>
       </section>
 
       <section class="workspace" aria-label="视频处理工作台">
         <form class="panel input-panel" data-form>
-          <label for="video-url">B 站视频链接</label>
+          <label for="video-url">视频链接</label>
           <div class="input-row">
-            <input id="video-url" data-url type="url" placeholder="https://www.bilibili.com/video/BV..." required>
+            <input id="video-url" data-url type="url" placeholder="https://www.bilibili.com/video/BV... 或其他视频平台链接" required>
             <button data-submit type="submit">提取并转写</button>
           </div>
           <button class="secondary-button" data-check-status type="button">读取本地进度</button>
@@ -53,7 +53,10 @@
         <section class="panel transcript-panel" aria-label="已保存文稿">
           <div class="panel-heading">
             <h2>已保存文稿</h2>
-            <span>实时同步 transcript.txt</span>
+            <div class="heading-actions">
+              <span>实时同步 transcript.txt</span>
+              <button class="secondary-button" data-download type="button" disabled>下载文稿</button>
+            </div>
           </div>
           <textarea data-transcript readonly placeholder="每完成一个视频分段，这里会显示已经写入本地的文字。"></textarea>
         </section>
