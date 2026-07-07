@@ -2,8 +2,44 @@
   "name": "video-script-extract",
   "version": "1.0.0",
   "description": "Local web app to extract transcripts from video URLs",
-  "main": "server.js",
+  "main": "electron/main.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "desktop": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "local.video-script-extract",
+    "productName": "视频转写问答",
+    "asar": true,
+    "files": [
+      "electron/**/*",
+      "public/**/*",
+      "server.js",
+      "README.md",
+      ".env.example",
+      "package.json",
+      "!jobs/**/*",
+      "!data/**/*",
+      "!tmp/**/*",
+      "!.env",
+      "!.git/**/*",
+      "!.qoder/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "directories": {
+      "output": "dist"
+    }
+  },
+  "devDependencies": {
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12"
   }
 }

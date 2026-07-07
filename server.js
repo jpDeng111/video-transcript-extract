@@ -5,15 +5,18 @@ const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 const ROOT_DIR = __dirname;
+loadEnvFile(path.join(ROOT_DIR, ".env"));
+
+const APP_DATA_DIR = process.env.APP_DATA_DIR ? path.resolve(process.env.APP_DATA_DIR) : ROOT_DIR;
 const STATIC_DIR = path.join(ROOT_DIR, "public");
-const JOBS_ROOT = path.join(ROOT_DIR, "jobs");
-const DATA_DIR = path.join(ROOT_DIR, "data");
+const JOBS_ROOT = path.join(APP_DATA_DIR, "jobs");
+const DATA_DIR = path.join(APP_DATA_DIR, "data");
 const QUITTR_STATE_PATH = path.join(DATA_DIR, "quittr-state.json");
 const MAX_CHUNK_SECONDS = 120;
 const MAX_TRANSCRIBE_ATTEMPTS = 3;
 const CHUNKS_MANIFEST_NAME = "chunks-manifest.json";
 
-loadEnvFile(path.join(ROOT_DIR, ".env"));
+loadEnvFile(path.join(APP_DATA_DIR, ".env"), { override: APP_DATA_DIR !== ROOT_DIR });
 
 const ASR_MODEL_NAME = process.env.DASHSCOPE_ASR_MODEL || "qwen3.7-plus";
 const CHAT_MODEL_NAME = process.env.DASHSCOPE_CHAT_MODEL || "qwen3.7-plus";
@@ -116,9 +119,68 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
+let activeServer = null;
+
+function startServer(port = PORT, host = process.env.HOST || "127.0.0.1") {
+  if (activeServer) {
+    return Promise.resolve(buildServerInfo(activeServer, host));
+  }
+
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      activeServer = server;
+      const info = buildServerInfo(server, host);
+      console.log(`Server running at ${info.url}`);
+      resolve(info);
+    };
+
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, host);
+  });
+}
+
+function stopServer() {
+  if (!activeServer) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    activeServer.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      activeServer = null;
+      resolve();
+    });
+  });
+}
+
+function buildServerInfo(instance, fallbackHost) {
+  const address = instance.address();
+  const port = typeof address === "object" && address ? address.port : PORT;
+  const host = fallbackHost === "0.0.0.0" ? "127.0.0.1" : fallbackHost;
+  return {
+    server: instance,
+    host,
+    port,
+    url: `http://${host}:${port}`
+  };
+}
+
+if (require.main === module) {
+  startServer().catch((error) => {
+    console.error(getErrorMessage(error));
+    process.exit(1);
+  });
+}
 
 async function handleQuittrRelapse(req, res) {
   await readJson(req).catch(() => ({}));
@@ -358,7 +420,7 @@ async function handleTranscribe(req, res) {
       return sendJson(res, 400, { error: "Please provide a video URL." });
     }
 
-    if (!apiKey) {
+    if (!isConfiguredApiKey(apiKey)) {
       return sendJson(res, 500, { error: "Missing DASHSCOPE_API_KEY in .env." });
     }
 
@@ -600,7 +662,7 @@ async function handleAsk(req, res) {
     const sourceUrl = String(body.url || "").trim();
     const jobId = String(body.jobId || "").trim();
 
-    if (!apiKey) {
+    if (!isConfiguredApiKey(apiKey)) {
       return sendJson(res, 500, { error: "Missing DASHSCOPE_API_KEY in .env." });
     }
 
@@ -1583,7 +1645,7 @@ function buildPublicConfig() {
   const apiKey = String(process.env.DASHSCOPE_API_KEY || "");
   return {
     dashscope: {
-      apiKeyConfigured: Boolean(apiKey.trim()),
+      apiKeyConfigured: isConfiguredApiKey(apiKey),
       apiKeyLength: apiKey.length || 0,
       baseUrl: API_BASE_URL,
       asrModel: ASR_MODEL_NAME,
@@ -1591,6 +1653,11 @@ function buildPublicConfig() {
     },
     ytdlpExtraArgsConfigured: YTDLP_EXTRA_ARGS.length > 0
   };
+}
+
+function isConfiguredApiKey(value) {
+  const apiKey = String(value || "").trim();
+  return Boolean(apiKey) && !/^your[_-]?dashscope[_-]?api[_-]?key/i.test(apiKey);
 }
 
 function formatDashScopeError(detail) {
@@ -1962,11 +2029,12 @@ function readJson(req) {
   });
 }
 
-function loadEnvFile(filePath) {
+function loadEnvFile(filePath, options = {}) {
   if (!fs.existsSync(filePath)) {
     return;
   }
 
+  const override = Boolean(options.override);
   const text = fs.readFileSync(filePath, "utf8");
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -1981,7 +2049,7 @@ function loadEnvFile(filePath) {
 
     const key = trimmed.slice(0, index).trim();
     const value = unquoteEnvValue(trimmed.slice(index + 1).trim());
-    if (key && !process.env[key]) {
+    if (key && (override || !process.env[key])) {
       process.env[key] = value;
     }
   }
@@ -2054,3 +2122,14 @@ function parseShellArgs(value) {
 function getErrorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
+
+module.exports = {
+  startServer,
+  stopServer,
+  paths: {
+    rootDir: ROOT_DIR,
+    appDataDir: APP_DATA_DIR,
+    jobsRoot: JOBS_ROOT,
+    dataDir: DATA_DIR
+  }
+};
