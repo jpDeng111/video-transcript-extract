@@ -5,6 +5,7 @@
 ## 功能特性
 
 - **多平台支持**：自动识别 B 站、YouTube、抖音、小红书、Twitter 等平台，按平台适配下载参数
+- **合集批量转写**：粘贴合集/播放列表链接自动识别，逐个视频批量转写并实时显示每个视频进度
 - **视频直传模型**：将视频以 `video_url` 格式直接输入 `qwen3.7-plus`，同时利用画面和音频信息
 - **断点续传**：中断后重新提交同一链接，自动从断点继续
 - **文稿下载**：转写完成后可一键下载 txt 文件，文件名格式为 `标题-博主名-平台.txt`
@@ -34,7 +35,7 @@ DASHSCOPE_API_KEY=你的百炼 API Key
 DASHSCOPE_BASE_URL=https://coding.dashscope.aliyuncs.com/v1
 DASHSCOPE_ASR_MODEL=qwen3.7-plus
 DASHSCOPE_CHAT_MODEL=qwen3.7-plus
-PORT=3000
+PORT=3002
 # 可选：全局 yt-dlp 额外参数（如代理），各平台参数已自动适配
 YTDLP_EXTRA_ARGS=
 ```
@@ -51,7 +52,7 @@ brew install yt-dlp ffmpeg
 npm start
 ```
 
-5. 打开浏览器访问 `http://localhost:3000`
+5. 打开浏览器访问 `http://localhost:3002`
 
 ## 使用方式
 
@@ -60,6 +61,33 @@ npm start
 3. 等待视频分段识别完成，文稿会实时显示在页面上，同时写入 `jobs/<hash>/transcript.txt`。
 4. 转写完成后，点击"下载文稿"按钮可下载 txt 文件（文件名为 `标题-博主名-平台.txt`）。
 5. 在"文稿问答"里输入问题，应用会基于当前文稿回答。
+
+## 合集批量转写
+
+直接在同一个输入框粘贴合集或播放列表链接即可，应用会自动判断：
+
+- **单个视频** → 走常规单视频流程
+- **合集 / 播放列表** → 自动解析所有视频，逐个转写
+
+支持的合集链接示例：
+
+| 平台 | 合集链接 |
+|---|---|
+| B 站 | 合集页 `collectiondetail?sid=xxx`、多 P 视频 |
+| YouTube | 播放列表 `youtube.com/playlist?list=xxx` |
+
+处理时页面会出现"合集进度"面板：
+
+- 顶部显示总进度条与 `已完成/总数`
+- 下方列出每个视频，实时更新状态（等待中 → 处理中 → 已完成 / 失败）
+- 每个视频单独保存到自己的 `jobs/<hash>/` 目录，可分别下载文稿
+- 单个视频失败不会中断整个合集，会自动继续下一个
+- 重新提交同一合集会跳过已完成的视频（断点续传）
+
+对应的 API：
+
+- `POST /api/playlist-check`：探测链接是否为合集，返回 `{ isPlaylist, count, entries }`
+- `POST /api/transcribe-batch`：批量转写合集，NDJSON 流式推送每个视频的进度事件
 
 ## 视频分段策略
 

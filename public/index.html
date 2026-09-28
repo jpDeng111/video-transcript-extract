@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>视频转写问答</title>
-    <link rel="stylesheet" href="/styles.css?v=bili-audio-qa-20260629">
+    <link rel="stylesheet" href="/styles.css?v=status-colors-20260928">
   </head>
   <body>
     <main class="shell">
@@ -25,7 +25,7 @@
           <p class="hint">视频、分段和文稿会保存在项目的 <code>jobs/&lt;hash&gt;/</code> 目录下。</p>
         </form>
 
-        <section class="panel status-panel" aria-label="处理状态">
+        <section class="panel status-panel" aria-label="处理状态" data-status-panel data-status-kind="idle">
           <div class="status-row">
             <span data-status>等待提交视频链接。</span>
             <span class="status-dot" aria-hidden="true"></span>
@@ -48,6 +48,17 @@
             </div>
           </dl>
           <p class="path-line">本地结果：<span data-transcript-path>尚未生成</span></p>
+        </section>
+
+        <section class="panel batch-panel" aria-label="合集进度" data-batch-panel hidden>
+          <div class="panel-heading">
+            <h2>合集进度</h2>
+            <span data-batch-summary>0/0 个视频</span>
+          </div>
+          <div class="batch-progress-bar">
+            <span data-batch-progress></span>
+          </div>
+          <ol class="batch-video-list" data-batch-list></ol>
         </section>
 
         <section class="panel transcript-panel" aria-label="已保存文稿">
@@ -82,6 +93,6 @@
         </section>
       </section>
     </main>
-    <script src="/app.js?v=bili-audio-qa-20260629"></script>
+    <script src="/app.js?v=status-colors-20260928"></script>
   </body>
 </html>

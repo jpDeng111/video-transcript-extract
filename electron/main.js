@@ -1,11 +1,15 @@
 const fs = require("fs");
 const path = require("path");
-const { app, BrowserWindow, Menu, dialog, shell } = require("electron");
+const { app, BrowserWindow, Menu, Notification, dialog, ipcMain, shell } = require("electron");
 
 const APP_NAME = "视频转写问答";
 let mainWindow = null;
 let serverInfo = null;
 let serverModule = null;
+
+function getIconPath() {
+  return path.join(app.getAppPath(), "assets", "icon.png");
+}
 
 function extendPathForDesktopLaunch() {
   const additions = [
@@ -67,11 +71,13 @@ function createWindow(url) {
     minWidth: 960,
     minHeight: 680,
     title: APP_NAME,
+    icon: getIconPath(),
     backgroundColor: "#f6f3ee",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      preload: path.join(__dirname, "preload.js")
     }
   });
 
@@ -139,11 +145,46 @@ function buildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+function registerNotificationIpc() {
+  if (process.platform === "darwin" && typeof Notification.requestAuthorization === "function") {
+    Notification.requestAuthorization();
+  }
+
+  ipcMain.on("app:notify", (_event, payload) => {
+    if (!Notification.isSupported()) {
+      return;
+    }
+
+    const notification = new Notification({
+      title: String(payload?.title || "").slice(0, 120) || "视频转写问答",
+      body: String(payload?.body || "").slice(0, 500),
+      silent: false
+    });
+
+    notification.on("click", () => {
+      if (!mainWindow) {
+        return;
+      }
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.show();
+      mainWindow.focus();
+    });
+
+    notification.show();
+  });
+}
+
 app.setName(APP_NAME);
 
 app.whenReady().then(async () => {
   try {
     const info = await startLocalServer();
+    if (process.platform === "darwin") {
+      app.dock.setIcon(getIconPath());
+    }
+    registerNotificationIpc();
     buildMenu();
     createWindow(info.url);
   } catch (error) {

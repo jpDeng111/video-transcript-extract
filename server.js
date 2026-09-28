@@ -15,6 +15,9 @@ const QUITTR_STATE_PATH = path.join(DATA_DIR, "quittr-state.json");
 const MAX_CHUNK_SECONDS = 120;
 const MAX_TRANSCRIBE_ATTEMPTS = 3;
 const CHUNKS_MANIFEST_NAME = "chunks-manifest.json";
+const activeJobRuns = new Set();
+const activeChildProcesses = new Set();
+let shuttingDown = false;
 
 loadEnvFile(path.join(APP_DATA_DIR, ".env"), { override: APP_DATA_DIR !== ROOT_DIR });
 
@@ -89,6 +92,14 @@ const server = http.createServer(async (req, res) => {
       return await handleTranscribe(req, res);
     }
 
+    if (req.method === "POST" && url.pathname === "/api/transcribe-batch") {
+      return await handleBatchTranscribe(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/playlist-check") {
+      return await handlePlaylistCheck(req, res);
+    }
+
     if (req.method === "POST" && url.pathname === "/api/ask") {
       return await handleAsk(req, res);
     }
@@ -146,6 +157,16 @@ function startServer(port = PORT, host = process.env.HOST || "127.0.0.1") {
 }
 
 function stopServer() {
+  shuttingDown = true;
+  for (const child of activeChildProcesses) {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Process may have already exited.
+    }
+  }
+  activeChildProcesses.clear();
+
   if (!activeServer) {
     return Promise.resolve();
   }
@@ -180,6 +201,13 @@ if (require.main === module) {
     console.error(getErrorMessage(error));
     process.exit(1);
   });
+
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+      stopServer().catch(() => {}).finally(() => process.exit(0));
+      setTimeout(() => process.exit(0), 3000).unref();
+    });
+  }
 }
 
 async function handleQuittrRelapse(req, res) {
@@ -410,6 +438,7 @@ function formatCompactDays(days) {
 
 async function handleTranscribe(req, res) {
   let job = null;
+  let acquiredRun = false;
 
   try {
     const body = await readJson(req);
@@ -427,6 +456,15 @@ async function handleTranscribe(req, res) {
     assertRequiredCommands(["yt-dlp", "ffmpeg", "ffprobe"]);
 
     job = createJob(videoUrl);
+
+    if (activeJobRuns.has(job.id)) {
+      return sendJson(res, 409, {
+        error: "该视频正在后台处理中，请勿重复提交，稍后刷新即可看到进度。"
+      });
+    }
+    activeJobRuns.add(job.id);
+    acquiredRun = true;
+
     fs.mkdirSync(job.dir, { recursive: true });
     fs.mkdirSync(job.chunksDir, { recursive: true });
     fs.mkdirSync(job.resultsDir, { recursive: true });
@@ -647,6 +685,234 @@ async function handleTranscribe(req, res) {
       return sendJson(res, 500, { error: message });
     }
 
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(`${JSON.stringify({ type: "error", error: message })}\n`);
+    }
+    res.end();
+  } finally {
+    if (acquiredRun && job) {
+      activeJobRuns.delete(job.id);
+    }
+  }
+}
+
+async function handlePlaylistCheck(req, res) {
+  try {
+    const body = await readJson(req);
+    const videoUrl = String(body.url || "").trim();
+
+    if (!videoUrl) {
+      return sendJson(res, 400, { error: "Please provide a URL." });
+    }
+
+    assertRequiredCommands(["yt-dlp"]);
+    const entries = await fetchPlaylistEntries(videoUrl);
+
+    if (entries && entries.length > 1) {
+      return sendJson(res, 200, { isPlaylist: true, count: entries.length, entries });
+    }
+
+    return sendJson(res, 200, { isPlaylist: false });
+  } catch (error) {
+    return sendJson(res, 200, { isPlaylist: false, error: getErrorMessage(error) });
+  }
+}
+
+async function handleBatchTranscribe(req, res) {
+  let batchDir = null;
+
+  try {
+    const body = await readJson(req);
+    const playlistUrl = String(body.url || "").trim();
+    const apiKey = String(process.env.DASHSCOPE_API_KEY || "").trim();
+
+    if (!playlistUrl) {
+      return sendJson(res, 400, { error: "Please provide a playlist URL." });
+    }
+
+    if (!isConfiguredApiKey(apiKey)) {
+      return sendJson(res, 500, { error: "Missing DASHSCOPE_API_KEY in .env." });
+    }
+
+    assertRequiredCommands(["yt-dlp", "ffmpeg", "ffprobe"]);
+
+    const batchId = crypto.createHash("sha256").update(`batch:${playlistUrl}`).digest("hex").slice(0, 16);
+    batchDir = path.join(JOBS_ROOT, `batch-${batchId}`);
+    fs.mkdirSync(batchDir, { recursive: true });
+
+    res.writeHead(200, {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive"
+    });
+
+    const sendEvent = (payload) => {
+      if (res.writableEnded || res.destroyed) return;
+      try { res.write(`${JSON.stringify(payload)}\n`); } catch {}
+    };
+
+    sendEvent({
+      type: "batch-start",
+      step: "fetching-playlist",
+      message: "正在解析合集视频列表...",
+      batchId
+    });
+
+    const entries = await fetchPlaylistEntries(playlistUrl);
+
+    if (!entries || entries.length === 0) {
+      sendEvent({ type: "error", error: "未找到合集视频，请确认链接是否为合集/播放列表。" });
+      return res.end();
+    }
+
+    sendEvent({
+      type: "batch-info",
+      totalVideos: entries.length,
+      batchId,
+      message: `找到 ${entries.length} 个视频，开始处理...`
+    });
+
+    writeJsonFile(path.join(batchDir, "manifest.json"), {
+      batchId,
+      sourceUrl: playlistUrl,
+      totalVideos: entries.length,
+      entries,
+      createdAt: new Date().toISOString()
+    });
+
+    let completedVideos = 0;
+
+    for (let v = 0; v < entries.length; v++) {
+      const entry = entries[v];
+      const job = createJob(entry.url);
+      const isLast = v === entries.length - 1;
+
+      sendEvent({
+        type: "batch-video-start",
+        videoIndex: v,
+        totalVideos: entries.length,
+        videoTitle: entry.title,
+        videoUrl: entry.url,
+        message: `[${v + 1}/${entries.length}] ${entry.title}`
+      });
+
+      if (activeJobRuns.has(job.id)) {
+        completedVideos++;
+        sendEvent({
+          type: "batch-video-error",
+          jobId: job.id, videoIndex: v, totalVideos: entries.length,
+          videoTitle: entry.title, videoUrl: entry.url,
+          completedVideos, error: "该视频已有任务在处理中，跳过。",
+          message: `[${v + 1}/${entries.length}] 跳过（已有任务在处理）：${entry.title}`
+        });
+        continue;
+      }
+      activeJobRuns.add(job.id);
+
+      try {
+        fs.mkdirSync(job.dir, { recursive: true });
+        fs.mkdirSync(job.chunksDir, { recursive: true });
+        fs.mkdirSync(job.resultsDir, { recursive: true });
+
+        const wrappedSend = (payload) => {
+          sendEvent({
+            ...payload,
+            batchVideoIndex: v,
+            batchTotalVideos: entries.length
+          });
+        };
+
+        updateCheckpoint(job, {
+          id: job.id, sourceUrl: entry.url, asrModel: ASR_MODEL_NAME,
+          chunkSeconds: MAX_CHUNK_SECONDS, status: "preparing"
+        });
+
+        const existingTranscript = readTextFile(job.transcriptPath);
+        if (existingTranscript) {
+          wrappedSend({ type: "partial", transcript: existingTranscript, transcriptPath: job.transcriptPath });
+        }
+
+        const info = await downloadVideo(entry.url, job, wrappedSend);
+        wrappedSend({ type: "status", step: "downloaded", message: `已下载：${info.title}` });
+
+        const metadata = {
+          id: job.id, sourceUrl: entry.url, title: info.title,
+          uploader: info.uploader || "", asrModel: ASR_MODEL_NAME,
+          chatModel: CHAT_MODEL_NAME, chunkSeconds: MAX_CHUNK_SECONDS,
+          updatedAt: new Date().toISOString(), transcriptPath: job.transcriptPath
+        };
+        writeJsonFile(job.metadataPath, metadata);
+
+        const chunks = await splitVideo(info.videoPath, job, wrappedSend);
+        wrappedSend({ type: "status", step: "chunks_ready", message: `已切成 ${chunks.length} 段` });
+
+        for (let index = 0; index < chunks.length; index++) {
+          const chunkPath = chunks[index];
+          const resultPath = getChunkResultPath(job, index);
+          const existingChunkText = readTextFile(resultPath);
+
+          if (existingChunkText) {
+            const transcript = rebuildTranscript(job, chunks.length);
+            wrappedSend({ type: "partial", jobId: job.id, transcript, transcriptPath: job.transcriptPath });
+            wrappedSend({ type: "status", step: "resume", message: `跳过已完成段 ${index + 1}/${chunks.length}`, progress: Math.round(((index + 1) / chunks.length) * 100) });
+            continue;
+          }
+
+          wrappedSend({ type: "status", step: "transcribing", message: `识别段 ${index + 1}/${chunks.length}...`, progress: Math.round((index / chunks.length) * 100) });
+
+          const piece = await transcribeChunkWithRetry({
+            apiKey, chunkPath, job, index, totalChunks: chunks.length, sendEvent: wrappedSend
+          });
+
+          writeTextFileAtomic(resultPath, piece.trim() ? `${piece.trim()}\n` : "");
+          const transcript = rebuildTranscript(job, chunks.length);
+          wrappedSend({ type: "partial", jobId: job.id, transcript, transcriptPath: job.transcriptPath });
+          wrappedSend({ type: "status", step: "saved", message: `已保存段 ${index + 1}/${chunks.length}`, progress: Math.round(((index + 1) / chunks.length) * 100) });
+        }
+
+        const finalText = readTextFile(job.transcriptPath).trim();
+        updateCheckpoint(job, {
+          id: job.id, sourceUrl: entry.url, title: info.title, asrModel: ASR_MODEL_NAME,
+          totalChunks: chunks.length, completedChunks: chunks.length,
+          lastCompletedChunk: chunks.length - 1, currentChunk: null,
+          status: "complete", completedAt: new Date().toISOString(), transcriptPath: job.transcriptPath
+        });
+
+        completedVideos++;
+        sendEvent({
+          type: "batch-video-done",
+          jobId: job.id, videoIndex: v, totalVideos: entries.length,
+          videoTitle: info.title, videoUrl: entry.url,
+          completedVideos, transcript: finalText,
+          transcriptPath: job.transcriptPath,
+          message: `[${v + 1}/${entries.length}] 完成：${info.title}`
+        });
+      } catch (videoError) {
+        const errorMsg = getErrorMessage(videoError);
+        completedVideos++;
+        sendEvent({
+          type: "batch-video-error",
+          jobId: job.id, videoIndex: v, totalVideos: entries.length,
+          videoTitle: entry.title, videoUrl: entry.url,
+          completedVideos, error: errorMsg,
+          message: `[${v + 1}/${entries.length}] 失败：${entry.title} — ${errorMsg}`
+        });
+      } finally {
+        activeJobRuns.delete(job.id);
+      }
+    }
+
+    sendEvent({
+      type: "batch-done",
+      batchId, totalVideos: entries.length,
+      completedVideos, message: `合集处理完成：${completedVideos}/${entries.length} 个视频`
+    });
+    res.end();
+  } catch (error) {
+    const message = getErrorMessage(error);
+    if (!res.headersSent) {
+      return sendJson(res, 500, { error: message });
+    }
     if (!res.writableEnded && !res.destroyed) {
       res.write(`${JSON.stringify({ type: "error", error: message })}\n`);
     }
@@ -1010,6 +1276,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
   }
 
   let sourcePath = existingSourcePath;
+  let downloadProblem = "";
   const outputTemplate = path.join(job.dir, "source.%(ext)s");
 
   if (!sourcePath) {
@@ -1022,9 +1289,19 @@ async function downloadVideo(videoUrl, job, sendEvent) {
     await downloadWithYtDlp(videoUrl, outputTemplate, job, sendEvent);
 
     sourcePath = findFirstFile(job.dir, /^source\.(mp4|mkv|webm|mov|m4v)$/i);
-    if (sourcePath && !await isValidMediaFile(sourcePath)) {
-      removeFileIfExists(sourcePath);
-      sourcePath = "";
+    if (sourcePath) {
+      const validation = await validateMediaFile(sourcePath);
+      if (!validation.ok) {
+        downloadProblem =
+          `downloaded file ${path.basename(sourcePath)} failed validation ` +
+          `(${validation.reason}) and was removed`;
+        removeFileIfExists(sourcePath);
+        sourcePath = "";
+      }
+    } else {
+      const leftovers = fs.readdirSync(job.dir).join(", ") || "empty directory";
+      downloadProblem =
+        `yt-dlp exited successfully but produced no video file (job folder: ${leftovers})`;
     }
   } else {
     sendEvent({
@@ -1035,7 +1312,10 @@ async function downloadVideo(videoUrl, job, sendEvent) {
   }
 
   if (!sourcePath) {
-    throw new Error("Could not find downloaded video file.");
+    throw new Error(
+      `Could not find downloaded video file: ${downloadProblem}. ` +
+      `See yt-dlp.log in the job folder for details.`
+    );
   }
 
   sendEvent({
@@ -1225,7 +1505,10 @@ async function downloadWithYtDlp(videoUrl, outputTemplate, job, sendEvent) {
     });
 
     try {
-      await runCommand("yt-dlp", strategy.args, { cwd: job.dir });
+      await runCommand("yt-dlp", strategy.args, {
+        cwd: job.dir,
+        logPath: path.join(job.dir, "yt-dlp.log")
+      });
       return;
     } catch (error) {
       lastError = error;
@@ -1258,7 +1541,10 @@ async function downloadAudioWithYtDlp(videoUrl, outputTemplate, job, sendEvent) 
     });
 
     try {
-      await runCommand("yt-dlp", strategy.args, { cwd: job.dir });
+      await runCommand("yt-dlp", strategy.args, {
+        cwd: job.dir,
+        logPath: path.join(job.dir, "yt-dlp.log")
+      });
       return;
     } catch (error) {
       lastError = error;
@@ -1296,9 +1582,17 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
   ];
 
   if (options.audioOnly) {
-    baseArgs.unshift("-f", "ba/bestaudio");
+    baseArgs.unshift("-f", "ba[protocol=https]/ba/bestaudio");
   } else {
-    baseArgs.unshift("--merge-output-format", "mp4");
+    // Prefer https (progressive/DASH) over m3u8: HLS fragment downloads are
+    // far more fragile over slow/unstable connections, and degraded YouTube
+    // extractions sometimes expose only m3u8 plus one low-res https format.
+    baseArgs.unshift(
+      "-f",
+      "bv*[protocol=https]+ba[protocol=https]/b[protocol=https]/bv*+ba/b",
+      "--merge-output-format",
+      "mp4"
+    );
   }
 
   const strategies = [
@@ -1878,17 +2172,30 @@ function removeFileIfExists(filePath) {
   fs.rmSync(filePath, { force: true });
 }
 
-async function isValidMediaFile(filePath) {
+async function validateMediaFile(filePath) {
   if (!fs.existsSync(filePath)) {
-    return false;
+    return { ok: false, reason: "file does not exist" };
   }
 
   try {
     const duration = await getMediaDuration(filePath);
-    return Number.isFinite(duration) && duration > 0;
-  } catch {
-    return false;
+    if (Number.isFinite(duration) && duration > 0) {
+      return { ok: true, reason: "" };
+    }
+    return {
+      ok: false,
+      reason: `ffprobe reported no usable duration (got: ${JSON.stringify(duration)})`
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `ffprobe could not read the file: ${getErrorMessage(error)}`
+    };
   }
+}
+
+async function isValidMediaFile(filePath) {
+  return (await validateMediaFile(filePath)).ok;
 }
 
 async function fetchVideoInfo(videoUrl) {
@@ -1909,6 +2216,58 @@ async function fetchVideoInfo(videoUrl) {
     };
   } catch {
     return { title: "Untitled Video", uploader: "" };
+  }
+}
+
+async function fetchPlaylistEntries(videoUrl) {
+  try {
+    const platform = detectPlatform(videoUrl);
+    const platformArgs = getPlatformArgs(platform);
+
+    const output = await runCommand("yt-dlp", [
+      "--flat-playlist",
+      "--yes-playlist",
+      "--print",
+      "%(id)s\t%(title)s\t%(url)s",
+      "--no-warnings",
+      ...platformArgs,
+      ...YTDLP_EXTRA_ARGS,
+      videoUrl
+    ]);
+
+    const lines = output.trim().split("\n").filter(Boolean);
+    if (lines.length <= 1) {
+      return null;
+    }
+
+    const entries = [];
+    for (const line of lines) {
+      const parts = line.split("\t");
+      const id = (parts[0] || "").trim();
+      const title = (parts[1] || "").trim() || `Video ${id}`;
+      const rawUrl = (parts[2] || "").trim();
+
+      if (!id) continue;
+
+      let url = rawUrl;
+      if (!url || url === "NA") {
+        if (platform === "bilibili") {
+          url = `https://www.bilibili.com/video/${id}`;
+        } else if (platform === "youtube") {
+          url = `https://www.youtube.com/watch?v=${id}`;
+        } else if (platform === "douyin") {
+          url = `https://www.douyin.com/video/${id}`;
+        } else {
+          url = id;
+        }
+      }
+
+      entries.push({ url, title, id });
+    }
+
+    return entries.length > 1 ? entries : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1952,11 +2311,20 @@ function findCommandInPath(command) {
 
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
+    if (shuttingDown) {
+      reject(new Error(`${command} skipped: server is shutting down.`));
+      return;
+    }
+
     const child = spawn(command, args, {
-      cwd: options.cwd || ROOT_DIR,
+      // APP_DATA_DIR, not ROOT_DIR: in the packaged app ROOT_DIR lives inside
+      // app.asar, which is not a real directory and makes spawn fail ENOENT.
+      cwd: options.cwd || APP_DATA_DIR,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"]
     });
+
+    activeChildProcesses.add(child);
 
     let stdout = "";
     let stderr = "";
@@ -1970,10 +2338,27 @@ function runCommand(command, args, options = {}) {
     });
 
     child.on("error", (error) => {
+      activeChildProcesses.delete(child);
       reject(new Error(`${command} failed to start: ${error.message}`));
     });
 
     child.on("close", (code) => {
+      activeChildProcesses.delete(child);
+
+      if (options.logPath) {
+        try {
+          const stdoutExcerpt = stdout.length > 8000
+            ? `${stdout.slice(0, 2000)}\n...[truncated]...\n${stdout.slice(-6000)}`
+            : stdout;
+          fs.appendFileSync(
+            options.logPath,
+            `\n===== ${new Date().toISOString()} ${command} ${args.join(" ")} (exit ${code}) =====\n${stdoutExcerpt}\n${stderr}\n`
+          );
+        } catch {
+          // Logging must never break the pipeline.
+        }
+      }
+
       if (code === 0) {
         resolve(stdout);
         return;
