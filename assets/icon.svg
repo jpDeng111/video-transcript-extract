@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Cartoon rabbit video transcript app icon">
+  <defs>
+    <radialGradient id="bgGlow" cx="38%" cy="24%" r="76%">
+      <stop offset="0" stop-color="#fff6c8"/>
+      <stop offset="0.42" stop-color="#70dcc8"/>
+      <stop offset="1" stop-color="#2468d8"/>
+    </radialGradient>
+    <linearGradient id="tileShade" x1="128" y1="80" x2="896" y2="944" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#07275e" stop-opacity="0.2"/>
+    </linearGradient>
+    <linearGradient id="earPink" x1="328" y1="112" x2="498" y2="558" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffbfd0"/>
+      <stop offset="1" stop-color="#ff7eaa"/>
+    </linearGradient>
+    <linearGradient id="fur" x1="240" y1="212" x2="788" y2="858" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.7" stop-color="#f5f8ff"/>
+      <stop offset="1" stop-color="#d7e7ff"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="420" y1="468" x2="734" y2="808" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e9f1ff"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="26" stdDeviation="28" flood-color="#09275c" flood-opacity="0.28"/>
+    </filter>
+    <filter id="smallShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#09275c" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" rx="224" fill="url(#bgGlow)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#tileShade)"/>
+  <circle cx="798" cy="178" r="64" fill="#fff3a1" opacity="0.82"/>
+  <circle cx="190" cy="724" r="82" fill="#ffffff" opacity="0.13"/>
+  <circle cx="852" cy="720" r="126" fill="#ffffff" opacity="0.1"/>
+
+  <g filter="url(#softShadow)">
+    <path d="M377 438C294 360 262 227 296 125c8-24 35-36 58-25 96 45 151 177 144 301z" fill="url(#fur)"/>
+    <path d="M391 402C340 335 323 226 346 158c47 37 83 126 86 228z" fill="url(#earPink)" opacity="0.95"/>
+    <path d="M636 431c89-70 132-199 108-305-6-25-31-40-55-32-101 34-171 159-178 284z" fill="url(#fur)"/>
+    <path d="M630 395c58-61 87-167 72-237-50 31-94 116-109 217z" fill="url(#earPink)" opacity="0.95"/>
+
+    <ellipse cx="512" cy="538" rx="284" ry="262" fill="url(#fur)"/>
+    <path d="M276 572c37 147 142 228 270 228 118 0 207-65 244-178-31 153-136 251-279 251-150 0-258-111-235-301z" fill="#dbeaff" opacity="0.85"/>
+
+    <circle cx="404" cy="500" r="47" fill="#16325f"/>
+    <circle cx="410" cy="484" r="13" fill="#ffffff"/>
+    <circle cx="608" cy="500" r="47" fill="#16325f"/>
+    <circle cx="614" cy="484" r="13" fill="#ffffff"/>
+
+    <path d="M493 574c10-14 28-14 38 0 8 12 1 29-19 37-20-8-27-25-19-37z" fill="#ff6f9f"/>
+    <path d="M512 612c-3 42-32 65-74 53" fill="none" stroke="#183565" stroke-width="17" stroke-linecap="round"/>
+    <path d="M512 612c3 42 32 65 74 53" fill="none" stroke="#183565" stroke-width="17" stroke-linecap="round"/>
+
+    <g opacity="0.72" stroke="#16325f" stroke-width="14" stroke-linecap="round">
+      <path d="M295 594c-58-18-108-17-151 3"/>
+      <path d="M298 646c-54 7-96 27-130 59"/>
+      <path d="M729 594c58-18 108-17 151 3"/>
+      <path d="M726 646c54 7 96 27 130 59"/>
+    </g>
+  </g>
+
+  <g filter="url(#smallShadow)">
+    <rect x="420" y="655" width="304" height="214" rx="38" fill="url(#paper)"/>
+    <path d="M724 713l-63-58v59c0 15 12 27 27 27h36z" fill="#c9dbff"/>
+    <path d="M472 725h167" stroke="#2e75ff" stroke-width="19" stroke-linecap="round"/>
+    <path d="M472 778h204" stroke="#58d5be" stroke-width="19" stroke-linecap="round"/>
+    <path d="M472 831h146" stroke="#ff8eb1" stroke-width="19" stroke-linecap="round"/>
+  </g>
+
+  <g filter="url(#smallShadow)">
+    <circle cx="285" cy="742" r="75" fill="#16325f"/>
+    <path d="M268 702l65 40-65 40z" fill="#ffffff"/>
+  </g>
+</svg>
