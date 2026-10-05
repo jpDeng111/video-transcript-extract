@@ -3,6 +3,8 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { createReadingDocument, getTranscriptHash, toReadingMarkdown } = require("./lib/transcript-reading");
+const { createYtDlpProgress, createFfmpegProgress, countProgress } = require("./lib/process-progress");
 
 const ROOT_DIR = __dirname;
 loadEnvFile(path.join(ROOT_DIR, ".env"));
@@ -17,6 +19,7 @@ const MAX_TRANSCRIBE_ATTEMPTS = 3;
 const CHUNKS_MANIFEST_NAME = "chunks-manifest.json";
 const activeJobRuns = new Set();
 const activeChildProcesses = new Set();
+const activeReadingRuns = new Map();
 let shuttingDown = false;
 
 loadEnvFile(path.join(APP_DATA_DIR, ".env"), { override: APP_DATA_DIR !== ROOT_DIR });
@@ -104,6 +107,10 @@ const server = http.createServer(async (req, res) => {
       return await handleAsk(req, res);
     }
 
+    if (req.method === "POST" && url.pathname === "/api/reading") {
+      return await handleReading(req, res);
+    }
+
     if (req.method === "GET" && url.pathname === "/api/config") {
       return sendJson(res, 200, buildPublicConfig());
     }
@@ -158,6 +165,9 @@ function startServer(port = PORT, host = process.env.HOST || "127.0.0.1") {
 
 function stopServer() {
   shuttingDown = true;
+  for (const run of activeReadingRuns.values()) {
+    run.controller.abort(new Error("应用退出，主题整理已中断；重新打开后可重试。"));
+  }
   for (const child of activeChildProcesses) {
     try {
       child.kill("SIGTERM");
@@ -475,6 +485,8 @@ async function handleTranscribe(req, res) {
       Connection: "keep-alive"
     });
 
+    const progressController = new AbortController();
+    res.once("close", () => progressController.abort());
     const sendEvent = (payload) => {
       if (res.writableEnded || res.destroyed) {
         return;
@@ -554,6 +566,7 @@ async function handleTranscribe(req, res) {
     });
 
     for (let index = 0; index < chunks.length; index += 1) {
+      sendTranscribeProgress(job, chunks.length, sendEvent);
       const chunkPath = chunks[index];
       const resultPath = getChunkResultPath(job, index);
       const existingChunkText = readTextFile(resultPath);
@@ -583,6 +596,7 @@ async function handleTranscribe(req, res) {
           message: `跳过已完成视频段 ${index + 1}/${chunks.length}。`,
           progress: Math.round(((index + 1) / chunks.length) * 100)
         });
+        sendTranscribeProgress(job, chunks.length, sendEvent);
         continue;
       }
 
@@ -640,6 +654,7 @@ async function handleTranscribe(req, res) {
         message: `已保存视频段 ${index + 1}/${chunks.length} 到 transcript.txt。`,
         progress: Math.round(((index + 1) / chunks.length) * 100)
       });
+      sendTranscribeProgress(job, chunks.length, sendEvent);
     }
 
     const finalText = readTextFile(job.transcriptPath).trim();
@@ -656,6 +671,7 @@ async function handleTranscribe(req, res) {
       completedAt: new Date().toISOString(),
       transcriptPath: job.transcriptPath
     });
+    const readingState = await prepareReadingAfterTranscribe(job, sendEvent, progressController.signal);
     sendEvent({
       type: "done",
       jobId: job.id,
@@ -663,6 +679,7 @@ async function handleTranscribe(req, res) {
       sourceUrl: videoUrl,
       transcript: finalText,
       transcriptPath: job.transcriptPath,
+      ...readingState,
       progress: 100
     });
     res.end();
@@ -746,6 +763,8 @@ async function handleBatchTranscribe(req, res) {
       Connection: "keep-alive"
     });
 
+    const progressController = new AbortController();
+    res.once("close", () => progressController.abort());
     const sendEvent = (payload) => {
       if (res.writableEnded || res.destroyed) return;
       try { res.write(`${JSON.stringify(payload)}\n`); } catch {}
@@ -847,6 +866,7 @@ async function handleBatchTranscribe(req, res) {
         wrappedSend({ type: "status", step: "chunks_ready", message: `已切成 ${chunks.length} 段` });
 
         for (let index = 0; index < chunks.length; index++) {
+          sendTranscribeProgress(job, chunks.length, wrappedSend);
           const chunkPath = chunks[index];
           const resultPath = getChunkResultPath(job, index);
           const existingChunkText = readTextFile(resultPath);
@@ -855,6 +875,7 @@ async function handleBatchTranscribe(req, res) {
             const transcript = rebuildTranscript(job, chunks.length);
             wrappedSend({ type: "partial", jobId: job.id, transcript, transcriptPath: job.transcriptPath });
             wrappedSend({ type: "status", step: "resume", message: `跳过已完成段 ${index + 1}/${chunks.length}`, progress: Math.round(((index + 1) / chunks.length) * 100) });
+            sendTranscribeProgress(job, chunks.length, wrappedSend);
             continue;
           }
 
@@ -868,6 +889,7 @@ async function handleBatchTranscribe(req, res) {
           const transcript = rebuildTranscript(job, chunks.length);
           wrappedSend({ type: "partial", jobId: job.id, transcript, transcriptPath: job.transcriptPath });
           wrappedSend({ type: "status", step: "saved", message: `已保存段 ${index + 1}/${chunks.length}`, progress: Math.round(((index + 1) / chunks.length) * 100) });
+          sendTranscribeProgress(job, chunks.length, wrappedSend);
         }
 
         const finalText = readTextFile(job.transcriptPath).trim();
@@ -877,6 +899,7 @@ async function handleBatchTranscribe(req, res) {
           lastCompletedChunk: chunks.length - 1, currentChunk: null,
           status: "complete", completedAt: new Date().toISOString(), transcriptPath: job.transcriptPath
         });
+        const readingState = await prepareReadingAfterTranscribe(job, wrappedSend, progressController.signal);
 
         completedVideos++;
         sendEvent({
@@ -885,6 +908,7 @@ async function handleBatchTranscribe(req, res) {
           videoTitle: info.title, videoUrl: entry.url,
           completedVideos, transcript: finalText,
           transcriptPath: job.transcriptPath,
+          ...readingState,
           message: `[${v + 1}/${entries.length}] 完成：${info.title}`
         });
       } catch (videoError) {
@@ -965,6 +989,167 @@ async function handleAsk(req, res) {
   }
 }
 
+function getReadingState(job, transcript = readTextFile(job.transcriptPath)) {
+  const sourceHash = getTranscriptHash(transcript);
+  const reading = readJsonFile(job.readingPath);
+  const state = readJsonFile(job.readingStatePath);
+  if (transcript.trim() && reading.version === 1 && reading.sourceHash === sourceHash && Array.isArray(reading.sections) && reading.sections.length) {
+    const readingProgress = state.sourceHash === sourceHash && state.status === "ready" && state.readingProgress?.percent === 100
+      ? state.readingProgress : { percent: 100 };
+    return { reading, readingStatus: "ready", readingError: "", readingProgress };
+  }
+  const run = activeReadingRuns.get(job.id);
+  if (run?.sourceHash === sourceHash) {
+    return { reading: null, readingStatus: "generating", readingError: "", readingProgress: run.progress };
+  }
+  if (state.sourceHash !== sourceHash) {
+    return { reading: null, readingStatus: "missing", readingError: "" };
+  }
+  const interrupted = state.status === "generating";
+  return {
+    reading: null,
+    readingStatus: interrupted || state.status === "failed" ? "failed" : "missing",
+    readingError: interrupted ? "上次主题整理已中断，可以重新生成；逐字稿不受影响。" : state.error || ""
+  };
+}
+
+// A disconnected/throwing observer must not cancel the shared model request or
+// prevent other subscribers from receiving the same batch completion.
+function notifyReadingSubscriber(run, subscriber) {
+  try {
+    Promise.resolve(subscriber({ ...run.progress })).catch(() => run.subscribers.delete(subscriber));
+  } catch {
+    run.subscribers.delete(subscriber);
+  }
+}
+
+async function generateReadingForJob(job, { onProgress, signal } = {}) {
+  const transcript = readTextFile(job.transcriptPath).trim();
+  if (!transcript) throw new Error("文稿为空，请先完成转写。");
+  const cached = getReadingState(job, transcript);
+  if (cached.reading) {
+    if (onProgress && !signal?.aborted) {
+      try { await onProgress({ ...cached.readingProgress }); } catch { /* Observer only. */ }
+    }
+    return cached.reading;
+  }
+  if (shuttingDown) throw new Error("应用正在退出，请重新打开后生成主题阅读版。");
+  const sourceHash = getTranscriptHash(transcript);
+  let run = activeReadingRuns.get(job.id);
+  if (run && run.sourceHash !== sourceHash) throw new Error("文稿内容已变化，请等待当前整理结束后重新生成。");
+  if (!run) {
+    const apiKey = String(process.env.DASHSCOPE_API_KEY || "").trim();
+    const metadata = readJsonFile(job.metadataPath);
+    const controller = new AbortController();
+    run = { controller, sourceHash, progress: { percent: null }, subscribers: new Set(), promise: null };
+    const publish = (progress, status = "generating") => {
+      controller.signal.throwIfAborted();
+      // All batches may be validated, but saving/hash verification is still pending.
+      const next = status === "ready" ? progress : { ...progress, percent: Math.min(99, progress.percent) };
+      if (JSON.stringify(run.progress) === JSON.stringify(next)) return;
+      writeJsonFile(job.readingStatePath, {
+        sourceHash, status, readingProgress: next, updatedAt: new Date().toISOString()
+      });
+      run.progress = next;
+      for (const subscriber of run.subscribers) notifyReadingSubscriber(run, subscriber);
+    };
+    // Register before invoking progress callbacks so concurrent callers share the
+    // same promise, controller, counts, and hash even during the first batch.
+    activeReadingRuns.set(job.id, run);
+    run.promise = Promise.resolve().then(async () => {
+      try {
+        writeJsonFile(job.readingStatePath, {
+          sourceHash, status: "generating", readingProgress: run.progress, updatedAt: new Date().toISOString()
+        });
+        controller.signal.throwIfAborted();
+        if (!isConfiguredApiKey(apiKey)) throw new Error("未配置模型 API Key，逐字稿已保留，可配置后重试主题整理。");
+        const reading = await createReadingDocument({
+          transcript,
+          title: metadata.title || "未命名视频",
+          sourceUrl: metadata.sourceUrl || "",
+          model: CHAT_MODEL_NAME,
+          onProgress: (progress) => publish(progress),
+          requestModel: (messages) => callDashScopeChat(apiKey, {
+            model: CHAT_MODEL_NAME, messages, stream: true
+          }, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(120000)]) })
+        });
+        controller.signal.throwIfAborted();
+        if (getTranscriptHash(readTextFile(job.transcriptPath)) !== sourceHash) {
+          throw new Error("文稿内容已变化，请重新生成主题阅读版。");
+        }
+        writeTextFileAtomic(job.readingMarkdownPath, toReadingMarkdown(reading));
+        writeJsonFile(job.readingPath, reading);
+        publish({ ...run.progress, percent: 100 }, "ready");
+        return reading;
+      } catch (error) {
+        writeJsonFile(job.readingStatePath, {
+          sourceHash, status: "failed", readingProgress: run.progress,
+          error: getErrorMessage(error), updatedAt: new Date().toISOString()
+        });
+        throw error;
+      } finally {
+        run.subscribers.clear();
+        if (activeReadingRuns.get(job.id) === run) activeReadingRuns.delete(job.id);
+      }
+    });
+  }
+  // Use a per-caller wrapper: removing one subscriber must not remove another
+  // caller that happens to pass the same callback function.
+  const subscriber = onProgress ? (progress) => onProgress(progress) : null;
+  const unsubscribe = () => run.subscribers.delete(subscriber);
+  if (subscriber && !signal?.aborted) {
+    run.subscribers.add(subscriber);
+    signal?.addEventListener("abort", unsubscribe, { once: true });
+    notifyReadingSubscriber(run, subscriber);
+  }
+  try {
+    return await run.promise;
+  } finally {
+    unsubscribe();
+    signal?.removeEventListener("abort", unsubscribe);
+  }
+}
+
+async function prepareReadingAfterTranscribe(job, sendEvent, signal) {
+  sendEvent({
+    type: "reading-status", jobId: job.id, readingStatus: "generating",
+    message: "逐字稿已保存，正在整理主题、重点和目录..."
+  });
+  try {
+    const reading = await generateReadingForJob(job, {
+      signal,
+      onProgress: (progress) => sendStageProgress(job, sendEvent, "reading", progress)
+    });
+    sendEvent({ type: "reading-status", jobId: job.id, readingStatus: "ready", message: "主题阅读版已保存。" });
+    return { reading, readingStatus: "ready", readingError: "" };
+  } catch (error) {
+    const readingError = getErrorMessage(error);
+    sendEvent({
+      type: "reading-status", jobId: job.id, readingStatus: "failed", readingError,
+      message: "主题整理暂未完成，逐字稿已保留，可以稍后重试。"
+    });
+    return { reading: null, readingStatus: "failed", readingError };
+  }
+}
+
+async function handleReading(req, res) {
+  try {
+    const body = await readJson(req);
+    const jobId = String(body.jobId || "").trim();
+    const sourceUrl = String(body.url || "").trim();
+    const job = jobId ? getJobById(jobId) : sourceUrl ? createJob(sourceUrl) : null;
+    if (!job) return sendJson(res, 400, { error: "请提供视频链接或任务 ID。" });
+    if (!fs.existsSync(job.transcriptPath)) return sendJson(res, 404, { error: "还没有文稿，请先完成转写。" });
+    if (readJsonFile(job.checkpointPath).status !== "complete") {
+      return sendJson(res, 409, { error: "请等待逐字稿转写完成后再生成主题阅读版。" });
+    }
+    const reading = await generateReadingForJob(job);
+    return sendJson(res, 200, { jobId: job.id, reading, readingStatus: "ready", readingError: "" });
+  } catch (error) {
+    return sendJson(res, 500, { error: getErrorMessage(error) });
+  }
+}
+
 function handleJobStatus(url, res) {
   const sourceUrl = String(url.searchParams.get("url") || "").trim();
   const jobId = String(url.searchParams.get("jobId") || "").trim();
@@ -1013,11 +1198,17 @@ function handleDownload(url, res) {
   const parts = [title, uploader, platform].filter(Boolean);
   const rawName = parts.join("-");
   const safeName = rawName.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, "_").slice(0, 120);
-  const content = fs.readFileSync(job.transcriptPath, "utf-8");
-
+  const readingFormat = url.searchParams.get("format") === "reading";
+  let content = fs.readFileSync(job.transcriptPath, "utf-8");
+  if (readingFormat) {
+    const { reading } = getReadingState(job, content);
+    if (!reading) return sendJson(res, 404, { error: "主题阅读版尚未生成，请先生成后再下载。" });
+    content = toReadingMarkdown(reading);
+  }
+  const fileName = readingFormat ? `${safeName}-主题阅读版.md` : `${safeName}.txt`;
   res.writeHead(200, {
-    "Content-Type": "text/plain; charset=utf-8",
-    "Content-Disposition": `attachment; filename="${encodeURIComponent(safeName)}.txt"`,
+    "Content-Type": readingFormat ? "text/markdown; charset=utf-8" : "text/plain; charset=utf-8",
+    "Content-Disposition": `attachment; filename="${encodeURIComponent(fileName)}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
     "Access-Control-Allow-Origin": "*"
   });
   res.end(content);
@@ -1238,11 +1429,22 @@ async function splitAudio(audioPath, job, sendEvent) {
   }
 }
 
+function sendStageProgress(job, sendEvent, stage, progress) {
+  if (!shuttingDown) sendEvent({ type: "stage-progress", jobId: job.id, stage, ...progress });
+}
+
+function sendTranscribeProgress(job, total, sendEvent) {
+  sendStageProgress(job, sendEvent, "transcribe", countProgress(countCompletedChunks(job, total), total));
+}
+
 async function downloadVideo(videoUrl, job, sendEvent) {
   const existingMetadata = readJsonFile(job.metadataPath);
   let existingSourcePath = findFirstFile(job.dir, /^source\.(mp4|mkv|webm|mov|m4v)$/i);
+  sendStageProgress(job, sendEvent, "download", { percent: null });
 
   if (fs.existsSync(job.normalizedPath) && await isValidMediaFile(job.normalizedPath)) {
+    sendStageProgress(job, sendEvent, "download", { percent: 100 });
+    sendStageProgress(job, sendEvent, "normalize", { percent: 100 });
     sendEvent({
       type: "status",
       step: "resume",
@@ -1318,11 +1520,17 @@ async function downloadVideo(videoUrl, job, sendEvent) {
     );
   }
 
+  sendStageProgress(job, sendEvent, "download", { percent: 100 });
   sendEvent({
     type: "status",
     step: "normalize",
     message: "Normalizing video with ffmpeg..."
   });
+  sendStageProgress(job, sendEvent, "normalize", { percent: null });
+  const durationSeconds = await getMediaDuration(sourcePath);
+  sendStageProgress(job, sendEvent, "normalize", { percent: durationSeconds > 0 ? 0 : null });
+  const normalizationProgress = createFfmpegProgress(durationSeconds,
+    (progress) => sendStageProgress(job, sendEvent, "normalize", progress));
 
   const normalizedTmpPath = path.join(job.dir, `normalized.tmp-${process.pid}-${Date.now()}.mp4`);
   removeFileIfExists(normalizedTmpPath);
@@ -1354,7 +1562,8 @@ async function downloadVideo(videoUrl, job, sendEvent) {
     "+faststart",
     normalizedTmpPath
   ], {
-    cwd: job.dir
+    cwd: job.dir,
+    ...normalizationProgress
   });
 
   if (!await isValidMediaFile(normalizedTmpPath)) {
@@ -1363,6 +1572,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
   }
 
   fs.renameSync(normalizedTmpPath, job.normalizedPath);
+  sendStageProgress(job, sendEvent, "normalize", { percent: 100 });
   const videoInfo = existingMetadata.title ? { title: existingMetadata.title, uploader: existingMetadata.uploader || "" } : await fetchVideoInfo(videoUrl);
   return {
     title: videoInfo.title,
@@ -1373,6 +1583,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
 }
 
 async function splitVideo(videoPath, job, sendEvent) {
+  sendStageProgress(job, sendEvent, "split", { percent: null });
   const durationSeconds = await getMediaDuration(videoPath);
   if (durationSeconds <= MAX_CHUNK_SECONDS) {
     writeChunksManifest(job, {
@@ -1383,6 +1594,7 @@ async function splitVideo(videoPath, job, sendEvent) {
       chunks: [path.basename(videoPath)],
       singleFile: true
     });
+    sendStageProgress(job, sendEvent, "split", { percent: 100 });
     return [videoPath];
   }
 
@@ -1393,6 +1605,7 @@ async function splitVideo(videoPath, job, sendEvent) {
       step: "resume",
       message: `Found ${reusableChunks.length} complete video chunk(s), skipping split.`
     });
+    sendStageProgress(job, sendEvent, "split", { percent: 100 });
     return reusableChunks;
   }
 
@@ -1421,6 +1634,9 @@ async function splitVideo(videoPath, job, sendEvent) {
   fs.mkdirSync(tempChunksDir, { recursive: true });
 
   try {
+    sendStageProgress(job, sendEvent, "split", { percent: 0 });
+    const splittingProgress = createFfmpegProgress(durationSeconds,
+      (progress) => sendStageProgress(job, sendEvent, "split", progress));
     const chunkPattern = path.join(tempChunksDir, "chunk-%03d.mp4");
     await runCommand("ffmpeg", [
       "-y",
@@ -1452,7 +1668,8 @@ async function splitVideo(videoPath, job, sendEvent) {
       "16000",
       chunkPattern
     ], {
-      cwd: job.dir
+      cwd: job.dir,
+      ...splittingProgress
     });
 
     const chunkFiles = listChunkFiles(tempChunksDir);
@@ -1483,6 +1700,7 @@ async function splitVideo(videoPath, job, sendEvent) {
       singleFile: false
     });
 
+    sendStageProgress(job, sendEvent, "split", { percent: 100 });
     return finalChunks;
   } finally {
     fs.rmSync(tempChunksDir, { recursive: true, force: true });
@@ -1504,10 +1722,14 @@ async function downloadWithYtDlp(videoUrl, outputTemplate, job, sendEvent) {
       downloadStrategy: strategy.name
     });
 
+    sendStageProgress(job, sendEvent, "download", { percent: null });
+    const downloadProgress = createYtDlpProgress(
+      (progress) => sendStageProgress(job, sendEvent, "download", progress));
     try {
       await runCommand("yt-dlp", strategy.args, {
         cwd: job.dir,
-        logPath: path.join(job.dir, "yt-dlp.log")
+        logPath: path.join(job.dir, "yt-dlp.log"),
+        ...downloadProgress
       });
       return;
     } catch (error) {
@@ -1540,10 +1762,14 @@ async function downloadAudioWithYtDlp(videoUrl, outputTemplate, job, sendEvent) 
       downloadStrategy: strategy.name
     });
 
+    sendStageProgress(job, sendEvent, "download", { percent: null });
+    const downloadProgress = createYtDlpProgress(
+      (progress) => sendStageProgress(job, sendEvent, "download", progress));
     try {
       await runCommand("yt-dlp", strategy.args, {
         cwd: job.dir,
-        logPath: path.join(job.dir, "yt-dlp.log")
+        logPath: path.join(job.dir, "yt-dlp.log"),
+        ...downloadProgress
       });
       return;
     } catch (error) {
@@ -1565,6 +1791,8 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
 
   const baseArgs = [
     "--no-playlist",
+    "--newline",
+    "--progress",
     "--retries",
     "5",
     "--fragment-retries",
@@ -1673,7 +1901,12 @@ async function transcribeChunk({ apiKey, chunkPath }) {
             text: [
               "请把这段视频中的中文、英文或其他语言口播尽可能完整地转写成连续文字。",
               "不要总结，不要补充解释，不要输出无关内容。",
-              "如果有明显听不清的片段，用[不清晰]标记。"
+              "如果有明显听不清的片段，用[不清晰]标记。",
+              "如果这段视频里有多个人在讲话，请按说话人分行标注，每行格式为“- 角色名：说话内容”。",
+              "角色名请根据你听到的身份来命名，例如主持人、嘉宾、旁白、提问者，同一个人在这段里始终用同一个名字。",
+              "不要使用“说话人1”“说话人2”这类编号，因为不同片段的编号互不对应。",
+              "如果全程只有一个人讲话，不要添加任何角色前缀，直接输出连续文字。",
+              "标注只用于区分说话人，不得因此删减、改写或概括口播内容。"
             ].join("")
           }
         ]
@@ -1772,14 +2005,15 @@ async function askAboutTranscript({ apiKey, question, transcript, title, sourceU
   return text;
 }
 
-async function callDashScopeChat(apiKey, body) {
+async function callDashScopeChat(apiKey, body, options = {}) {
   const response = await fetch(`${API_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${apiKey}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal: options.signal
   });
 
   if (!response.ok) {
@@ -1897,7 +2131,9 @@ function buildJobStatus(job) {
     chunksDir: fs.existsSync(job.chunksDir) ? job.chunksDir : "",
     resultsDir: fs.existsSync(job.resultsDir) ? job.resultsDir : "",
     transcriptPath: fs.existsSync(job.transcriptPath) ? job.transcriptPath : "",
+    transcript: transcript.trim(),
     transcriptPreview: transcript.trim().slice(0, 2000),
+    ...getReadingState(job, transcript),
     error: checkpoint.error || "",
     lastChunkError: checkpoint.lastChunkError || "",
     updatedAt: checkpoint.updatedAt || metadata.updatedAt || ""
@@ -2005,7 +2241,10 @@ function createJob(videoUrl) {
     checkpointPath: path.join(dir, "checkpoint.json"),
     normalizedPath: path.join(dir, "normalized.mp4"),
     audioPath: path.join(dir, "audio.mp3"),
-    transcriptPath: path.join(dir, "transcript.txt")
+    transcriptPath: path.join(dir, "transcript.txt"),
+    readingPath: path.join(dir, "reading.json"),
+    readingMarkdownPath: path.join(dir, "reading.md"),
+    readingStatePath: path.join(dir, "reading-state.json")
   };
 }
 
@@ -2014,6 +2253,8 @@ function getJobById(jobId) {
     return null;
   }
 
+  // Hash IDs are canonical lowercase, including on case-insensitive macOS volumes.
+  jobId = jobId.toLowerCase();
   const dir = path.join(JOBS_ROOT, jobId);
   return {
     id: jobId,
@@ -2025,7 +2266,10 @@ function getJobById(jobId) {
     checkpointPath: path.join(dir, "checkpoint.json"),
     normalizedPath: path.join(dir, "normalized.mp4"),
     audioPath: path.join(dir, "audio.mp3"),
-    transcriptPath: path.join(dir, "transcript.txt")
+    transcriptPath: path.join(dir, "transcript.txt"),
+    readingPath: path.join(dir, "reading.json"),
+    readingMarkdownPath: path.join(dir, "reading.md"),
+    readingStatePath: path.join(dir, "reading-state.json")
   };
 }
 
@@ -2328,13 +2572,24 @@ function runCommand(command, args, options = {}) {
 
     let stdout = "";
     let stderr = "";
+    // Progress is observational: a parser/listener failure must not escape an
+    // EventEmitter callback or detach the still-running child from shutdown.
+    const notifyOutput = (callback, ...values) => {
+      try {
+        if (typeof callback === "function") Promise.resolve(callback(...values)).catch(() => {});
+      } catch {
+        // Preserve the command's original exit, error and logging behavior.
+      }
+    };
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
+      notifyOutput(options.onOutput, chunk, "stdout");
     });
 
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
+      notifyOutput(options.onOutput, chunk, "stderr");
     });
 
     child.on("error", (error) => {
@@ -2344,6 +2599,7 @@ function runCommand(command, args, options = {}) {
 
     child.on("close", (code) => {
       activeChildProcesses.delete(child);
+      notifyOutput(options.onOutputEnd);
 
       if (options.logPath) {
         try {

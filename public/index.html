@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>视频转写问答</title>
-    <link rel="stylesheet" href="/styles.css?v=status-colors-20260928">
+    <link rel="stylesheet" href="/styles.css?v=percent-progress-v1">
   </head>
   <body>
     <main class="shell">
@@ -30,9 +30,15 @@
             <span data-status>等待提交视频链接。</span>
             <span class="status-dot" aria-hidden="true"></span>
           </div>
-          <div class="progress" role="progressbar" aria-label="处理进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="progress-readout">
+            <div><p class="progress-label" data-progress-label>总进度 · 估算</p><div class="progress-number"><span data-progress-percent>0</span><span class="percent-sign">%</span></div></div>
+            <div class="progress-context"><strong data-progress-stage>等待开始</strong><span data-progress-elapsed>已等待 00:00</span></div>
+          </div>
+          <div class="progress" role="progressbar" aria-label="总进度 · 估算" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-describedby="progress-note">
             <span data-progress></span>
           </div>
+          <p class="progress-detail" data-progress-detail>各阶段加权估算，非实际完成比例。</p>
+          <p id="progress-note" class="progress-note" data-progress-note>真实分段完成数会单独显示；仅任务结束后到达 100%。</p>
           <dl class="job-summary" data-job-summary>
             <div>
               <dt>已完成</dt>
@@ -55,7 +61,8 @@
             <h2>合集进度</h2>
             <span data-batch-summary>0/0 个视频</span>
           </div>
-          <div class="batch-progress-bar">
+          <div class="batch-readout"><span data-batch-label>已处理 · 估算</span><strong><span data-batch-percent>0</span>%</strong></div>
+          <div class="batch-progress-bar" role="progressbar" aria-label="合集已处理进度 · 估算" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <span data-batch-progress></span>
           </div>
           <ol class="batch-video-list" data-batch-list></ol>
@@ -65,11 +72,50 @@
           <div class="panel-heading">
             <h2>已保存文稿</h2>
             <div class="heading-actions">
-              <span>实时同步 transcript.txt</span>
-              <button class="secondary-button" data-download type="button" disabled>下载文稿</button>
+              <button class="secondary-button" data-download-reading type="button" disabled>下载阅读版 · Markdown</button>
+              <button class="secondary-button" data-download type="button" disabled>下载原文</button>
             </div>
           </div>
-          <textarea data-transcript readonly placeholder="每完成一个视频分段，这里会显示已经写入本地的文字。"></textarea>
+          <div class="transcript-tabs" role="tablist" aria-label="文稿视图">
+            <button id="reading-tab" data-view="reading" type="button" role="tab" aria-selected="true" aria-controls="reading-view">主题阅读</button>
+            <button id="raw-tab" data-view="raw" type="button" role="tab" aria-selected="false" aria-controls="raw-view" tabindex="-1">逐字稿</button>
+          </div>
+          <div id="reading-view" role="tabpanel" aria-labelledby="reading-tab" data-reading-view>
+            <div class="reading-state" data-reading-state data-state="missing">
+              <p data-reading-message role="status" aria-live="polite">转写结束后，将自动整理主题、重点与目录。原始逐字稿始终保留。</p>
+              <p class="reading-error" data-reading-error hidden></p>
+              <div class="reading-progress" data-reading-progress-panel hidden>
+                <div class="progress-readout">
+                  <div><p class="progress-label" data-reading-progress-label>主题整理 · 估算</p><div class="progress-number"><span data-reading-percent>0</span><span class="percent-sign">%</span></div></div>
+                  <div class="progress-context"><strong>主题阅读</strong><span data-reading-elapsed>已等待 00:00</span></div>
+                </div>
+                <div class="progress" role="progressbar" aria-label="主题整理 · 估算" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-describedby="reading-progress-note"><span data-reading-progress></span></div>
+                <p class="progress-detail" data-reading-progress-detail>等待整理批次进度。</p>
+                <p id="reading-progress-note" class="progress-note" data-reading-progress-note>独立整理，不影响原始逐字稿。</p>
+              </div>
+              <button class="secondary-button" data-generate-reading type="button" hidden>生成主题阅读</button>
+            </div>
+            <article class="reading-document" data-reading-document hidden>
+              <header class="reading-overview">
+                <p class="eyebrow">主题阅读 / 概览</p>
+                <h3 data-reading-title></h3>
+                <p class="reading-summary" data-reading-summary></p>
+                <p class="hint">概览、重点与主题标题由 AI 整理，可能有误，请对照原文核实。正文仅移除软件分块标记并分段，未作删改。</p>
+              </header>
+              <section class="reading-highlights" aria-labelledby="reading-highlights-title">
+                <h4 id="reading-highlights-title">文稿重点</h4>
+                <ol class="reading-key-points" data-reading-points></ol>
+              </section>
+              <div class="reading-layout">
+                <nav class="reading-toc" aria-label="主题目录">
+                  <h4>主题目录</h4>
+                  <ol data-reading-toc></ol>
+                </nav>
+                <div class="reading-sections" data-reading-sections></div>
+              </div>
+            </article>
+          </div>
+          <textarea id="raw-view" role="tabpanel" aria-labelledby="raw-tab" data-transcript readonly hidden placeholder="每完成一个视频分段，这里会显示已经写入本地的文字。"></textarea>
         </section>
 
         <section class="panel qa-panel" aria-label="文稿问答">
@@ -93,6 +139,6 @@
         </section>
       </section>
     </main>
-    <script src="/app.js?v=status-colors-20260928"></script>
+    <script src="/app.js?v=percent-progress-v1"></script>
   </body>
 </html>
