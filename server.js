@@ -17,6 +17,12 @@ const QUITTR_STATE_PATH = path.join(DATA_DIR, "quittr-state.json");
 const MAX_CHUNK_SECONDS = 120;
 const MAX_TRANSCRIBE_ATTEMPTS = 3;
 const CHUNKS_MANIFEST_NAME = "chunks-manifest.json";
+// Seconds scanned at the end of a file to prove the download was complete.
+const MEDIA_TAIL_PROBE_SECONDS = Number(process.env.MEDIA_TAIL_PROBE_SECONDS) > 0
+  ? Number(process.env.MEDIA_TAIL_PROBE_SECONDS)
+  : 10;
+// A real stream carries dozens of packets in that window; a stub has none.
+const MEDIA_TAIL_MIN_PACKETS = 3;
 const activeJobRuns = new Set();
 const activeChildProcesses = new Set();
 const activeReadingRuns = new Map();
@@ -1218,7 +1224,7 @@ async function prepareAudio(videoUrl, job, sendEvent) {
   const existingMetadata = readJsonFile(job.metadataPath);
   let existingSourcePath = findFirstFile(job.dir, /^source\.(m4a|mp3|webm|mp4|mkv|mov|m4v|wav|aac|opus)$/i);
 
-  if (fs.existsSync(job.audioPath) && await isValidMediaFile(job.audioPath)) {
+  if (fs.existsSync(job.audioPath) && await isValidMediaFile(job.audioPath, { requireCompleteContent: true })) {
     sendEvent({
       type: "status",
       step: "resume",
@@ -1241,7 +1247,7 @@ async function prepareAudio(videoUrl, job, sendEvent) {
     removeFileIfExists(job.audioPath);
   }
 
-  if (existingSourcePath && !await isValidMediaFile(existingSourcePath)) {
+  if (existingSourcePath && !await isValidMediaFile(existingSourcePath, { requireCompleteContent: true })) {
     sendEvent({
       type: "status",
       step: "resume",
@@ -1261,13 +1267,7 @@ async function prepareAudio(videoUrl, job, sendEvent) {
       message: "正在用 yt-dlp 提取音频..."
     });
 
-    await downloadAudioWithYtDlp(videoUrl, outputTemplate, job, sendEvent);
-
-    sourcePath = findFirstFile(job.dir, /^source\.(m4a|mp3|webm|mp4|mkv|mov|m4v|wav|aac|opus)$/i);
-    if (sourcePath && !await isValidMediaFile(sourcePath)) {
-      removeFileIfExists(sourcePath);
-      sourcePath = "";
-    }
+    sourcePath = await downloadAudioWithYtDlp(videoUrl, outputTemplate, job, sendEvent);
   } else {
     sendEvent({
       type: "status",
@@ -1306,7 +1306,7 @@ async function prepareAudio(videoUrl, job, sendEvent) {
     cwd: job.dir
   });
 
-  if (!await isValidMediaFile(normalizedTmpPath)) {
+  if (!await isValidMediaFile(normalizedTmpPath, { requireCompleteContent: true })) {
     removeFileIfExists(normalizedTmpPath);
     throw new Error("Audio normalization completed but the output file is not readable.");
   }
@@ -1442,7 +1442,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
   let existingSourcePath = findFirstFile(job.dir, /^source\.(mp4|mkv|webm|mov|m4v)$/i);
   sendStageProgress(job, sendEvent, "download", { percent: null });
 
-  if (fs.existsSync(job.normalizedPath) && await isValidMediaFile(job.normalizedPath)) {
+  if (fs.existsSync(job.normalizedPath) && await isValidMediaFile(job.normalizedPath, { requireCompleteContent: true })) {
     sendStageProgress(job, sendEvent, "download", { percent: 100 });
     sendStageProgress(job, sendEvent, "normalize", { percent: 100 });
     sendEvent({
@@ -1467,7 +1467,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
     removeFileIfExists(job.normalizedPath);
   }
 
-  if (existingSourcePath && !await isValidMediaFile(existingSourcePath)) {
+  if (existingSourcePath && !await isValidMediaFile(existingSourcePath, { requireCompleteContent: true })) {
     sendEvent({
       type: "status",
       step: "resume",
@@ -1478,7 +1478,6 @@ async function downloadVideo(videoUrl, job, sendEvent) {
   }
 
   let sourcePath = existingSourcePath;
-  let downloadProblem = "";
   const outputTemplate = path.join(job.dir, "source.%(ext)s");
 
   if (!sourcePath) {
@@ -1488,23 +1487,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
       message: "Downloading video with yt-dlp..."
     });
 
-    await downloadWithYtDlp(videoUrl, outputTemplate, job, sendEvent);
-
-    sourcePath = findFirstFile(job.dir, /^source\.(mp4|mkv|webm|mov|m4v)$/i);
-    if (sourcePath) {
-      const validation = await validateMediaFile(sourcePath);
-      if (!validation.ok) {
-        downloadProblem =
-          `downloaded file ${path.basename(sourcePath)} failed validation ` +
-          `(${validation.reason}) and was removed`;
-        removeFileIfExists(sourcePath);
-        sourcePath = "";
-      }
-    } else {
-      const leftovers = fs.readdirSync(job.dir).join(", ") || "empty directory";
-      downloadProblem =
-        `yt-dlp exited successfully but produced no video file (job folder: ${leftovers})`;
-    }
+    sourcePath = await downloadWithYtDlp(videoUrl, outputTemplate, job, sendEvent);
   } else {
     sendEvent({
       type: "status",
@@ -1515,8 +1498,8 @@ async function downloadVideo(videoUrl, job, sendEvent) {
 
   if (!sourcePath) {
     throw new Error(
-      `Could not find downloaded video file: ${downloadProblem}. ` +
-      `See yt-dlp.log in the job folder for details.`
+      "Could not find downloaded video file. " +
+      "See yt-dlp.log in the job folder for details."
     );
   }
 
@@ -1566,7 +1549,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
     ...normalizationProgress
   });
 
-  if (!await isValidMediaFile(normalizedTmpPath)) {
+  if (!await isValidMediaFile(normalizedTmpPath, { requireCompleteContent: true })) {
     removeFileIfExists(normalizedTmpPath);
     throw new Error("Video normalization completed but the output file is not readable.");
   }
@@ -1709,47 +1692,36 @@ async function splitVideo(videoPath, job, sendEvent) {
 
 async function downloadWithYtDlp(videoUrl, outputTemplate, job, sendEvent) {
   const strategies = buildYtDlpStrategies(videoUrl, outputTemplate);
-  let lastError = null;
-
-  for (const strategy of strategies) {
-    sendEvent({
-      type: "status",
-      step: "download",
-      message: strategy.label
-    });
-    updateCheckpoint(job, {
-      status: "downloading",
-      downloadStrategy: strategy.name
-    });
-
-    sendStageProgress(job, sendEvent, "download", { percent: null });
-    const downloadProgress = createYtDlpProgress(
-      (progress) => sendStageProgress(job, sendEvent, "download", progress));
-    try {
-      await runCommand("yt-dlp", strategy.args, {
-        cwd: job.dir,
-        logPath: path.join(job.dir, "yt-dlp.log"),
-        ...downloadProgress
-      });
-      return;
-    } catch (error) {
-      lastError = error;
-      sendEvent({
-        type: "status",
-        step: "download_retry",
-        message: `${strategy.name} failed, trying next download strategy...`
-      });
-    }
-  }
-
-  throw new Error(formatYtDlpError(lastError, videoUrl));
+  return runYtDlpStrategies({
+    videoUrl,
+    job,
+    sendEvent,
+    strategies,
+    sourcePattern: /^source\.(mp4|mkv|webm|mov|m4v)$/i,
+    retryLabel: (strategy) => `${strategy.name} failed, trying next download strategy...`
+  });
 }
 
 async function downloadAudioWithYtDlp(videoUrl, outputTemplate, job, sendEvent) {
   const strategies = buildYtDlpStrategies(videoUrl, outputTemplate, {
     audioOnly: true
   });
+  return runYtDlpStrategies({
+    videoUrl,
+    job,
+    sendEvent,
+    strategies,
+    sourcePattern: /^source\.(m4a|mp3|webm|mp4|mkv|mov|m4v|wav|aac|opus)$/i,
+    retryLabel: (strategy) => `${strategy.name} 下载失败，正在尝试下一种方式...`
+  });
+}
+
+// yt-dlp can exit 0 on a truncated media file, so every strategy is validated
+// before it is accepted; a rejected file is deleted and the next strategy is
+// allowed to fetch it again (a different route often returns the real content).
+async function runYtDlpStrategies({ videoUrl, job, sendEvent, strategies, sourcePattern, retryLabel }) {
   let lastError = null;
+  let incompleteCount = 0;
 
   for (const strategy of strategies) {
     sendEvent({
@@ -1771,15 +1743,49 @@ async function downloadAudioWithYtDlp(videoUrl, outputTemplate, job, sendEvent) 
         logPath: path.join(job.dir, "yt-dlp.log"),
         ...downloadProgress
       });
-      return;
     } catch (error) {
       lastError = error;
       sendEvent({
         type: "status",
         step: "download_retry",
-        message: `${strategy.name} 下载失败，正在尝试下一种方式...`
+        message: retryLabel(strategy)
       });
+      continue;
     }
+
+    const sourcePath = findFirstFile(job.dir, sourcePattern);
+    if (!sourcePath) {
+      const leftovers = fs.readdirSync(job.dir).join(", ") || "empty directory";
+      lastError = new Error(
+        `yt-dlp exited successfully but produced no media file (job folder: ${leftovers})`);
+      sendEvent({
+        type: "status",
+        step: "download_retry",
+        message: `${strategy.name} produced no file, trying next download strategy...`
+      });
+      continue;
+    }
+
+    const validation = await validateMediaFile(sourcePath, { requireCompleteContent: true });
+    if (!validation.ok) {
+      removeFileIfExists(sourcePath);
+      incompleteCount++;
+      lastError = new Error(
+        `downloaded file ${path.basename(sourcePath)} is incomplete (${validation.reason})`);
+      sendEvent({
+        type: "status",
+        step: "download_retry",
+        message: `${strategy.name} returned an incomplete file, trying next download strategy...`
+      });
+      if (incompleteCount >= 2) {
+        // Two header-only stubs in a row means the platform is handing back the
+        // same broken stream; re-fetching it would only burn the user's bandwidth.
+        break;
+      }
+      continue;
+    }
+
+    return sourcePath;
   }
 
   throw new Error(formatYtDlpError(lastError, videoUrl));
@@ -1855,9 +1861,27 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
   }));
 }
 
+function humanFileSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
 function formatYtDlpError(error, videoUrl) {
   const message = getErrorMessage(error);
   const platform = detectPlatform(videoUrl || "");
+
+  if (/is incomplete|stopped early|packet\(s\) exist at the tail/i.test(message)) {
+    return [
+      "下载看似成功，但拿回来的文件其实是残缺的：文件头声称有完整时长，实际只有开头一小段数据，",
+      "四种下载方式里有两种都只拿到了同样的残缺文件，继续重试只会浪费流量。",
+      "这通常是 yt-dlp 版本过旧导致 YouTube 只回传低画质残缺格式造成的，请先升级：brew upgrade yt-dlp（pip 安装的用 pip install -U yt-dlp）。",
+      "升级后重新提交该视频即可；如果仍然残缺，可在 .env 里换用其它提取客户端参数，例如：",
+      "YTDLP_EXTRA_ARGS=\"--extractor-args youtube:player_client=default,android --proxy http://127.0.0.1:7890\"",
+      `原始错误：${message}`
+    ].join("\n");
+  }
 
   if (platform === "bilibili" && /HTTP Error 412|Precondition Failed/i.test(message)) {
     return [
@@ -2416,20 +2440,77 @@ function removeFileIfExists(filePath) {
   fs.rmSync(filePath, { force: true });
 }
 
-async function validateMediaFile(filePath) {
+// A truncated download can still look perfectly healthy to ffprobe: YouTube's
+// CDN sometimes hands back a stub whose moov box declares the full duration
+// while mdat only holds the first seconds of data (yt-dlp even exits 0 because
+// it received every byte the server promised). Duration alone therefore cannot
+// prove completeness — count the packets that actually exist at the tail.
+async function probeMediaTail(filePath, durationSeconds) {
+  const tailSeconds = MEDIA_TAIL_PROBE_SECONDS;
+  if (!(durationSeconds > tailSeconds * 2)) {
+    return { ok: true, reason: "" };
+  }
+
+  const startSeconds = Math.max(0, durationSeconds - tailSeconds).toFixed(3);
+  let output = "";
+  try {
+    output = await runCommand("ffprobe", [
+      "-v",
+      "error",
+      "-i",
+      filePath,
+      "-read_intervals",
+      `${startSeconds}%+${tailSeconds}`,
+      "-show_entries",
+      "packet=pts_time",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1"
+    ]);
+  } catch (error) {
+    const message = getErrorMessage(error);
+    if (/failed to start/i.test(message)) {
+      // ffprobe missing or unspawnable: never block a job on the tail probe.
+      return { ok: true, reason: "" };
+    }
+    return { ok: false, reason: `reading the last ${tailSeconds}s failed (${message.split("\n").find(Boolean)})` };
+  }
+
+  const packets = output.split("\n").filter((line) => line.trim() !== "").length;
+  if (packets < MEDIA_TAIL_MIN_PACKETS) {
+    const size = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+    return {
+      ok: false,
+      reason:
+        `only ${packets} packet(s) exist at the tail while the header claims ` +
+        `${Math.round(durationSeconds)}s (${humanFileSize(size)} on disk) — the download stopped early`
+    };
+  }
+
+  return { ok: true, reason: "" };
+}
+
+async function validateMediaFile(filePath, options = {}) {
   if (!fs.existsSync(filePath)) {
     return { ok: false, reason: "file does not exist" };
   }
 
   try {
     const duration = await getMediaDuration(filePath);
-    if (Number.isFinite(duration) && duration > 0) {
-      return { ok: true, reason: "" };
+    if (!Number.isFinite(duration) || duration <= 0) {
+      return {
+        ok: false,
+        reason: `ffprobe reported no usable duration (got: ${JSON.stringify(duration)})`
+      };
     }
-    return {
-      ok: false,
-      reason: `ffprobe reported no usable duration (got: ${JSON.stringify(duration)})`
-    };
+
+    if (options.requireCompleteContent) {
+      const tail = await probeMediaTail(filePath, duration);
+      if (!tail.ok) {
+        return { ok: false, reason: tail.reason };
+      }
+    }
+
+    return { ok: true, reason: "" };
   } catch (error) {
     return {
       ok: false,
@@ -2438,8 +2519,8 @@ async function validateMediaFile(filePath) {
   }
 }
 
-async function isValidMediaFile(filePath) {
-  return (await validateMediaFile(filePath)).ok;
+async function isValidMediaFile(filePath, options = {}) {
+  return (await validateMediaFile(filePath, options)).ok;
 }
 
 async function fetchVideoInfo(videoUrl) {

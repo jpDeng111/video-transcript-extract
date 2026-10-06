@@ -30,9 +30,15 @@ async function main() {
   await app.whenReady();
   const bin = path.join(temp, 'bin');
   fs.mkdirSync(bin);
-  for (const [name, output] of [['ffprobe', '2\n'], ['ffmpeg', '']]) {
+  for (const [name, output] of [['ffmpeg', '']]) {
     fs.writeFileSync(path.join(bin, name), `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(output)});\n`, { mode: 0o755 });
   }
+  // ffprobe answers both plain duration queries and the completeness probe,
+  // which asks for tail packets via -read_intervals.
+  fs.writeFileSync(path.join(bin, 'ffprobe'), `#!/usr/bin/env node
+const has = process.argv.includes('-read_intervals');
+process.stdout.write(has ? '0.0\\n1.0\\n2.0\\n3.0\\n' : '2\\n');
+`, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, 'yt-dlp'), `#!/usr/bin/env node
 const args = process.argv.slice(2);
 if (args.includes('--flat-playlist')) process.stdout.write('fixture\\t本地测试视频\\thttps://example.com/real-progress-contract\\n');

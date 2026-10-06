@@ -21,7 +21,16 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
     const read = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; } };
     const mode = read(path.join(process.cwd(), 'fake-command.json'));
     if (name === 'ffprobe') {
-      process.stdout.write(String(read(args.at(-1)).duration ?? 2) + '\\n');
+      if (args.includes('-read_intervals')) {
+        // Completeness probe: a healthy file always has packets at its tail.
+        // The probe runs outside the job cwd, so read the job's own mode file.
+        const probed = args[args.indexOf('-i') + 1];
+        const jobMode = read(path.join(path.dirname(probed), 'fake-command.json'));
+        const count = jobMode.tailPackets ?? mode.tailPackets ?? 4;
+        process.stdout.write(Array.from({ length: count }, (_, i) => i + '.0').join('\\n') + (count ? '\\n' : ''));
+      } else {
+        process.stdout.write(String(read(args.at(-1)).duration ?? 2) + '\\n');
+      }
     } else if (name === 'yt-dlp') {
       if (args.includes('--flat-playlist')) {
         process.stdout.write(${JSON.stringify(batchUrls.map((url, i) => `${i}\t测试视频${i + 1}\t${url}`).join('\n') + '\n')});
@@ -318,6 +327,18 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
       assert(!events.some(event => event.stage === stage && !event.scope && event.percent === 100), option);
       assert.equal(asrCalls, calls);
     }
+  });
+  await t.test('a header-only download stub is retried through every strategy and reported as truncated', async () => {
+    const target = seed('https://example.com/progress-failure-truncated');
+    fs.unlinkSync(path.join(target.dir, 'normalized.mp4'));
+    fs.writeFileSync(path.join(target.dir, 'fake-command.json'), JSON.stringify({ duration: 250, tailPackets: 0 }));
+    const response = await post('/api/transcribe', { url: target.url });
+    const events = (await response.text()).trim().split('\n').map(JSON.parse);
+    assert(events.some(event => event.type === 'error'));
+    assert.equal(events.filter(event => event.step === 'download_retry').length, 2,
+      'two header-only stubs stop the strategy loop instead of re-downloading four times');
+    assert.match(JSON.stringify(events), /残缺/);
+    assert.equal(fs.existsSync(path.join(target.dir, 'source.mp4')), false, 'the stub is deleted');
   });
   await t.test('failed ASR preserves completed chunk counts and never starts reading or reports 100', async () => {
     const target = seed('https://example.com/asr-progress-failure');
