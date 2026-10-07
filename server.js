@@ -1990,7 +1990,10 @@ async function transcribeChunkWithRetry({ apiKey, chunkPath, job, index, totalCh
 
 function isRetryableTranscribeError(error) {
   const message = getErrorMessage(error);
-  return /timeout|timed out|socket|network|ECONN|ETIMEDOUT|429|rate|Too Many|500|502|503|504|Bad Gateway|Service Unavailable/i.test(message);
+  // "terminated" is what undici reports when an SSE response is cut mid-stream
+  // (proxy hiccup, provider restart). It is transient like a timeout, and
+  // without it a whole lecture failed after 13/36 chunks on a single blip.
+  return /timeout|timed out|socket|network|ECONN|ETIMEDOUT|EPIPE|EAI_AGAIN|429|rate|Too Many|500|502|503|504|Bad Gateway|Service Unavailable|terminated|premature close|fetch failed|other side closed/i.test(message);
 }
 
 async function askAboutTranscript({ apiKey, question, transcript, title, sourceUrl }) {
