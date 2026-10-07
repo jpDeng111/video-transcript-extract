@@ -1779,8 +1779,12 @@ async function runYtDlpStrategies({ videoUrl, job, sendEvent, strategies, source
       });
       if (incompleteCount >= 2) {
         // Two header-only stubs in a row means the platform is handing back the
-        // same broken stream; re-fetching it would only burn the user's bandwidth.
-        break;
+        // same broken stream; re-fetching it would only burn the user's
+        // bandwidth — unless a later strategy changes the extraction path.
+        const hasDifferentExtraction = strategies
+          .slice(strategies.indexOf(strategy) + 1)
+          .some((next) => next.changesExtraction);
+        if (!hasDifferentExtraction) break;
       }
       continue;
     }
@@ -1851,14 +1855,58 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
     }
   ];
 
+  if (platform === "youtube") {
+    // A logged-in Chrome cookie jar makes YouTube answer with the "downgraded"
+    // streaming table, which for long lectures exposes only progressive format
+    // 18 — and that URL is served byte-truncated: yt-dlp reports
+    // "100% of 2.27MiB" and exits 0 while the moov box claims 79 minutes.
+    // Asking anonymously for the default player client instead returns real
+    // DASH representations (verified: 108.7MB / 4751s for nBor4jfWetQ).
+    // The height cap keeps this fallback the same size as the formats the
+    // other strategies get, since transcription never needs 1080p.
+    strategies.push({
+      name: "youtube_dash_without_cookies",
+      label: options.audioOnly
+        ? "正在去掉浏览器 Cookies，改用 YouTube DASH 音频通道重试..."
+        : "Retrying with YouTube DASH formats and no browser cookies...",
+      args: options.audioOnly
+        ? [
+          "--extractor-args", "youtube:player_client=default",
+          "-f", "ba[protocol=https][ext=m4a]/ba"
+        ]
+        : [
+          "--extractor-args", "youtube:player_client=default",
+          "-f",
+          "bv*[protocol=https][ext=mp4][vcodec^=avc1][height<=360]" +
+          "+ba[protocol=https][ext=m4a]/b[protocol=https][height<=360]"
+        ],
+      skipCookies: true,
+      changesExtraction: true
+    });
+  }
+
   return strategies.map((strategy) => ({
     ...strategy,
     args: [
-      ...baseArgs,
+      ...(strategy.skipCookies ? withoutCookieArgs(baseArgs) : baseArgs),
       ...(strategy.args || []),
       videoUrl
     ]
   }));
+}
+
+// yt-dlp cannot be told to "un-set" a cookie jar with an empty value, so the
+// cookie flags are dropped outright when a strategy has to look anonymous.
+function withoutCookieArgs(args) {
+  const result = [];
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] === "--cookies-from-browser" || args[index] === "--cookies") {
+      index++;
+      continue;
+    }
+    result.push(args[index]);
+  }
+  return result;
 }
 
 function humanFileSize(bytes) {
@@ -1875,10 +1923,10 @@ function formatYtDlpError(error, videoUrl) {
   if (/is incomplete|stopped early|packet\(s\) exist at the tail/i.test(message)) {
     return [
       "下载看似成功，但拿回来的文件其实是残缺的：文件头声称有完整时长，实际只有开头一小段数据，",
-      "四种下载方式里有两种都只拿到了同样的残缺文件，继续重试只会浪费流量。",
-      "这通常是 yt-dlp 版本过旧导致 YouTube 只回传低画质残缺格式造成的，请先升级：brew upgrade yt-dlp（pip 安装的用 pip install -U yt-dlp）。",
-      "升级后重新提交该视频即可；如果仍然残缺，可在 .env 里换用其它提取客户端参数，例如：",
-      "YTDLP_EXTRA_ARGS=\"--extractor-args youtube:player_client=default,android --proxy http://127.0.0.1:7890\"",
+      "所有下载方式（含去掉浏览器 Cookies 的 YouTube DASH 通道）都只拿到了同样的残缺文件，继续重试只会浪费流量。",
+      "这类残缺通常是代理节点把 YouTube 的响应提前截断了，请换一个代理出口节点（或在 Clash Verge 里切到全局模式）后重新提交该视频。",
+      "如果仍然残缺，可在 .env 里显式指定提取客户端与代理，例如：",
+      "YTDLP_EXTRA_ARGS=\"--extractor-args youtube:player_client=android --proxy http://127.0.0.1:7897\"",
       `原始错误：${message}`
     ].join("\n");
   }
