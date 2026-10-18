@@ -26,6 +26,7 @@ const MEDIA_TAIL_MIN_PACKETS = 3;
 const activeJobRuns = new Set();
 const activeChildProcesses = new Set();
 const activeReadingRuns = new Map();
+const activeJobControls = new Map();
 let shuttingDown = false;
 
 loadEnvFile(path.join(APP_DATA_DIR, ".env"), { override: APP_DATA_DIR !== ROOT_DIR });
@@ -103,6 +104,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/transcribe-batch") {
       return await handleBatchTranscribe(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/stop") {
+      return await handleStop(req, res);
     }
 
     if (req.method === "POST" && url.pathname === "/api/playlist-check") {
@@ -527,6 +532,9 @@ async function handleTranscribe(req, res) {
       });
     }
 
+    // Every stage of this run (child processes, model calls, retry backoff) hangs
+    // off this signal, so /api/stop can interrupt work that is already in flight.
+    beginJobRun(job);
     const info = await downloadVideo(videoUrl, job, sendEvent);
     sendEvent({
       type: "status",
@@ -572,6 +580,7 @@ async function handleTranscribe(req, res) {
     });
 
     for (let index = 0; index < chunks.length; index += 1) {
+      assertJobRunning(job);
       sendTranscribeProgress(job, chunks.length, sendEvent);
       const chunkPath = chunks[index];
       const resultPath = getChunkResultPath(job, index);
@@ -624,6 +633,7 @@ async function handleTranscribe(req, res) {
         status: "transcribing",
         transcriptPath: job.transcriptPath
       });
+      const chunkStartedAt = Date.now();
       const piece = await transcribeChunkWithRetry({
         apiKey,
         chunkPath,
@@ -634,6 +644,8 @@ async function handleTranscribe(req, res) {
       });
 
       writeTextFileAtomic(resultPath, piece.trim() ? `${piece.trim()}\n` : "");
+      // Only a finished chunk is a trustworthy sample for the remaining-time estimate.
+      job.run?.chunkDurations.push(Date.now() - chunkStartedAt);
       const transcript = rebuildTranscript(job, chunks.length);
       updateCheckpoint(job, {
         id: job.id,
@@ -691,6 +703,14 @@ async function handleTranscribe(req, res) {
     res.end();
   } catch (error) {
     const message = getErrorMessage(error);
+    const stoppedError = stoppedJobError(job, error);
+
+    if (stoppedError) {
+      markCheckpointStopped(job);
+      console.log(`Job ${job?.id || "unknown"} stopped by user request.`);
+      finishStreamAsStopped(res, job?.id);
+      return;
+    }
 
     if (job?.checkpointPath) {
       const checkpoint = readJsonFile(job.checkpointPath);
@@ -713,6 +733,7 @@ async function handleTranscribe(req, res) {
     }
     res.end();
   } finally {
+    endJobRun(job);
     if (acquiredRun && job) {
       activeJobRuns.delete(job.id);
     }
@@ -806,6 +827,7 @@ async function handleBatchTranscribe(req, res) {
     });
 
     let completedVideos = 0;
+    let batchStopped = false;
 
     for (let v = 0; v < entries.length; v++) {
       const entry = entries[v];
@@ -857,6 +879,7 @@ async function handleBatchTranscribe(req, res) {
           wrappedSend({ type: "partial", transcript: existingTranscript, transcriptPath: job.transcriptPath });
         }
 
+        beginJobRun(job);
         const info = await downloadVideo(entry.url, job, wrappedSend);
         wrappedSend({ type: "status", step: "downloaded", message: `已下载：${info.title}` });
 
@@ -872,6 +895,7 @@ async function handleBatchTranscribe(req, res) {
         wrappedSend({ type: "status", step: "chunks_ready", message: `已切成 ${chunks.length} 段` });
 
         for (let index = 0; index < chunks.length; index++) {
+          assertJobRunning(job);
           sendTranscribeProgress(job, chunks.length, wrappedSend);
           const chunkPath = chunks[index];
           const resultPath = getChunkResultPath(job, index);
@@ -887,11 +911,13 @@ async function handleBatchTranscribe(req, res) {
 
           wrappedSend({ type: "status", step: "transcribing", message: `识别段 ${index + 1}/${chunks.length}...`, progress: Math.round((index / chunks.length) * 100) });
 
+          const chunkStartedAt = Date.now();
           const piece = await transcribeChunkWithRetry({
             apiKey, chunkPath, job, index, totalChunks: chunks.length, sendEvent: wrappedSend
           });
 
           writeTextFileAtomic(resultPath, piece.trim() ? `${piece.trim()}\n` : "");
+          job.run?.chunkDurations.push(Date.now() - chunkStartedAt);
           const transcript = rebuildTranscript(job, chunks.length);
           wrappedSend({ type: "partial", jobId: job.id, transcript, transcriptPath: job.transcriptPath });
           wrappedSend({ type: "status", step: "saved", message: `已保存段 ${index + 1}/${chunks.length}`, progress: Math.round(((index + 1) / chunks.length) * 100) });
@@ -917,19 +943,50 @@ async function handleBatchTranscribe(req, res) {
           ...readingState,
           message: `[${v + 1}/${entries.length}] 完成：${info.title}`
         });
+
+        // A stop pressed during the reading stage is swallowed by that stage's own
+        // error handling, so the batch has to notice it or it would keep going.
+        if (job.run?.stopped) {
+          batchStopped = true;
+          sendEvent(stoppedEventPayload(job.id));
+        }
       } catch (videoError) {
-        const errorMsg = getErrorMessage(videoError);
-        completedVideos++;
-        sendEvent({
-          type: "batch-video-error",
-          jobId: job.id, videoIndex: v, totalVideos: entries.length,
-          videoTitle: entry.title, videoUrl: entry.url,
-          completedVideos, error: errorMsg,
-          message: `[${v + 1}/${entries.length}] 失败：${entry.title} — ${errorMsg}`
-        });
+        const stoppedError = stoppedJobError(job, videoError);
+        if (stoppedError) {
+          // One stop cancels the whole batch: this video keeps its completed chunks
+          // and the videos that never started are left for a later submit.
+          markCheckpointStopped(job);
+          batchStopped = true;
+          console.log(`Batch ${batchId} stopped by user request at video ${v + 1}/${entries.length}.`);
+          sendEvent(stoppedEventPayload(job.id));
+        } else {
+          const errorMsg = getErrorMessage(videoError);
+          completedVideos++;
+          sendEvent({
+            type: "batch-video-error",
+            jobId: job.id, videoIndex: v, totalVideos: entries.length,
+            videoTitle: entry.title, videoUrl: entry.url,
+            completedVideos, error: errorMsg,
+            message: `[${v + 1}/${entries.length}] 失败：${entry.title} — ${errorMsg}`
+          });
+        }
       } finally {
+        endJobRun(job);
         activeJobRuns.delete(job.id);
       }
+
+      if (batchStopped) {
+        writeBatchCheckpoint(batchDir, {
+          batchId, sourceUrl: playlistUrl, totalVideos: entries.length,
+          completedVideos, videoIndex: v
+        });
+        break;
+      }
+    }
+
+    if (batchStopped) {
+      res.end();
+      return;
     }
 
     sendEvent({
@@ -939,6 +996,11 @@ async function handleBatchTranscribe(req, res) {
     });
     res.end();
   } catch (error) {
+    if (error instanceof JobStoppedError) {
+      // A stop outside the per-video loop still ends the stream as a stop, not a 500.
+      console.log(`Batch ${batchDir ? path.basename(batchDir) : "unknown"} stopped by user request.`);
+      return finishStreamAsStopped(res, error.jobId);
+    }
     const message = getErrorMessage(error);
     if (!res.headersSent) {
       return sendJson(res, 500, { error: message });
@@ -947,6 +1009,29 @@ async function handleBatchTranscribe(req, res) {
       res.write(`${JSON.stringify({ type: "error", error: message })}\n`);
     }
     res.end();
+  }
+}
+
+// Stop answers as soon as the run controllers are aborted; the job's own stream
+// then reports the stopped event together with the preserved checkpoint.
+// An idle or unknown jobId is a no-op, never an error: the button may be clicked
+// after the job already finished.
+async function handleStop(req, res) {
+  try {
+    // A malformed body is treated like an empty one: stop must never be a 500.
+    const body = await readJson(req).catch(() => ({}));
+    const reason = String(body.reason || "").trim() || JOB_STOPPED_MESSAGE;
+
+    if (body.all === true) {
+      return sendJson(res, 200, { stopped: stopAllJobRuns(reason) });
+    }
+
+    // Hash ids are canonical lowercase, matching getJobById.
+    const jobId = String(body.jobId || "").trim().toLowerCase();
+    const stopped = jobId ? stopJobRun(jobId, reason) : "";
+    return sendJson(res, 200, { stopped: stopped ? [stopped] : [] });
+  } catch (error) {
+    return sendJson(res, 500, { error: getErrorMessage(error) });
   }
 }
 
@@ -1303,7 +1388,8 @@ async function prepareAudio(videoUrl, job, sendEvent) {
     "32k",
     normalizedTmpPath
   ], {
-    cwd: job.dir
+    cwd: job.dir,
+    signal: job.run?.signal
   });
 
   if (!await isValidMediaFile(normalizedTmpPath, { requireCompleteContent: true })) {
@@ -1392,7 +1478,8 @@ async function splitAudio(audioPath, job, sendEvent) {
       "32k",
       chunkPattern
     ], {
-      cwd: job.dir
+      cwd: job.dir,
+      signal: job.run?.signal
     });
 
     const chunkFiles = listChunkFiles(tempChunksDir);
@@ -1430,8 +1517,187 @@ async function splitAudio(audioPath, job, sendEvent) {
 }
 
 function sendStageProgress(job, sendEvent, stage, progress) {
-  if (!shuttingDown) sendEvent({ type: "stage-progress", jobId: job.id, stage, ...progress });
+  if (shuttingDown) return;
+  const run = job?.run;
+  if (run) {
+    if (run.stage !== stage) {
+      run.stage = stage;
+      run.stageStartedAt = Date.now();
+      run.stageAnchorPercent = null;
+    }
+    // A download switches from the video stream to the audio stream and the
+    // percent restarts; re-anchor the clock so the estimate stays honest.
+    const percent = Number(progress.percent);
+    if (Number.isFinite(percent) && run.stageAnchorPercent !== null && percent < run.stageAnchorPercent) {
+      run.stageStartedAt = Date.now();
+    }
+    if (Number.isFinite(percent)) run.stageAnchorPercent = percent;
+  }
+  sendEvent({ type: "stage-progress", jobId: job.id, stage, ...progress, ...estimateStageEta(run, progress) });
 }
+
+// "How much longer" is only ever answered from what this run actually measured:
+// the mean wall-clock time of the chunks it transcribed itself, or the elapsed
+// share of a stage that reports a real percentage. A stage with no denominator
+// gets no number rather than an invented one.
+function estimateStageEta(run, progress) {
+  if (!run) return {};
+  const now = Date.now();
+  const total = Number(progress.total) > 0 ? Number(progress.total) : null;
+  const completed = Number.isFinite(progress.completed) ? Number(progress.completed) : null;
+
+  if (total && completed !== null) {
+    const remaining = Math.max(0, total - completed);
+    // Chunk timings only ever describe the stage that measured them: applying the
+    // transcription rate to the reading batches would claim minutes per batch.
+    if (run.stage === "transcribe" && run.chunkDurations.length) {
+      const average = run.chunkDurations.reduce((sum, value) => sum + value, 0) / run.chunkDurations.length;
+      return { etaSeconds: Math.round(average * remaining / 1000), etaBasis: "chunk-rate" };
+    }
+    if (completed > 0) {
+      const elapsed = Math.max(0, now - run.stageStartedAt);
+      return { etaSeconds: Math.round(elapsed / completed * remaining / 1000), etaBasis: "stage-rate" };
+    }
+    return {};
+  }
+
+  const percent = Number(progress.percent);
+  if (Number.isFinite(percent) && percent > 0) {
+    const elapsed = Math.max(0, now - run.stageStartedAt);
+    return { etaSeconds: Math.round(elapsed * (100 - percent) / percent / 1000), etaBasis: "stage-rate" };
+  }
+  return {};
+}
+
+class JobStoppedError extends Error {
+  constructor(jobId) {
+    super("已手动停止，已完成的部分都保留在本地。");
+    this.name = "JobStoppedError";
+    this.jobId = jobId;
+  }
+}
+
+// One control per running job: the stop signal every child process and model
+// request hangs off, plus the timings the remaining-time estimate needs.
+function beginJobRun(job) {
+  const controller = new AbortController();
+  const run = {
+    jobId: job.id,
+    controller,
+    signal: controller.signal,
+    stopped: false,
+    startedAt: Date.now(),
+    stage: "",
+    stageStartedAt: Date.now(),
+    stageAnchorPercent: null,
+    chunkDurations: []
+  };
+  job.run = run;
+  activeJobControls.set(job.id, run);
+  return run;
+}
+
+function endJobRun(job) {
+  const run = job?.run;
+  if (!run) return;
+  if (activeJobControls.get(run.jobId) === run) activeJobControls.delete(run.jobId);
+  job.run = null;
+}
+
+// Returns the jobId it actually stopped, or "" when nothing was running, so the
+// stop route can report a list without inventing one.
+function stopJobRun(jobId, reason) {
+  const run = activeJobControls.get(jobId);
+  const reading = activeReadingRuns.get(jobId);
+  // The reading stage runs on its own controller and outlives the transcribe run
+  // lookup, so stopping a job has to abort both or the model calls keep burning.
+  if (reading) {
+    reading.controller.abort(new Error(reason));
+  }
+  if (run) {
+    run.stopped = true;
+    run.stopReason = reason;
+    // The abort listeners registered in runCommand kill the live child process;
+    // aborting first means the pipeline unwinds as a stop rather than a failure.
+    run.controller.abort(new JobStoppedError(jobId));
+    return jobId;
+  }
+  return reading ? jobId : "";
+}
+
+function stopAllJobRuns(reason) {
+  const stopped = [];
+  for (const jobId of new Set([...activeJobControls.keys(), ...activeReadingRuns.keys()])) {
+    const result = stopJobRun(jobId, reason);
+    if (result) stopped.push(result);
+  }
+  return stopped;
+}
+
+function assertJobRunning(job) {
+  if (job?.run?.stopped) throw new JobStoppedError(job.run.jobId);
+}
+
+// An aborted run can surface as the stop error, the signal's reason, or the HTTP
+// client's own abort error; all three mean "the user pressed stop", never retry.
+function stoppedJobError(job, error) {
+  if (error instanceof JobStoppedError) return error;
+  const run = job?.run;
+  if (!(run?.stopped || run?.signal?.aborted)) return null;
+  const reason = run.signal.reason;
+  return reason instanceof Error ? reason : new JobStoppedError(run.jobId);
+}
+
+const JOB_STOPPED_MESSAGE = "已手动停止，已完成的部分都保留在本地。";
+
+// The frontend keys on this exact event shape: a stop must never arrive as
+// type "error", or the user cannot tell a cancel from a real failure.
+function stoppedEventPayload(jobId) {
+  return { type: "stopped", jobId: jobId || "", message: JOB_STOPPED_MESSAGE };
+}
+
+function finishStreamAsStopped(res, jobId) {
+  const payload = stoppedEventPayload(jobId);
+
+  if (!res.headersSent) {
+    return sendJson(res, 200, payload);
+  }
+
+  if (!res.writableEnded && !res.destroyed) {
+    res.write(`${JSON.stringify(payload)}\n`);
+  }
+  res.end();
+}
+
+// Stopping keeps every completed-chunk field: the resume contract (results/chunk-*.txt,
+// chunks-manifest.json, checkpoint.json) decides where the next submit continues.
+function markCheckpointStopped(job) {
+  if (!job?.checkpointPath) return;
+  const checkpoint = readJsonFile(job.checkpointPath);
+  updateCheckpoint(job, {
+    ...checkpoint,
+    id: job.id,
+    status: "stopped",
+    currentChunk: null,
+    error: "",
+    stoppedAt: new Date().toISOString(),
+    transcriptPath: job.transcriptPath
+  });
+}
+
+function writeBatchCheckpoint(batchDir, { batchId, sourceUrl, totalVideos, completedVideos, videoIndex }) {
+  if (!batchDir) return;
+  writeJsonFile(path.join(batchDir, "checkpoint.json"), {
+    batchId,
+    sourceUrl,
+    status: "stopped",
+    totalVideos,
+    completedVideos,
+    stoppedVideoIndex: videoIndex,
+    stoppedAt: new Date().toISOString()
+  });
+}
+
 
 function sendTranscribeProgress(job, total, sendEvent) {
   sendStageProgress(job, sendEvent, "transcribe", countProgress(countCompletedChunks(job, total), total));
@@ -1546,6 +1812,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
     normalizedTmpPath
   ], {
     cwd: job.dir,
+    signal: job.run?.signal,
     ...normalizationProgress
   });
 
@@ -1652,6 +1919,7 @@ async function splitVideo(videoPath, job, sendEvent) {
       chunkPattern
     ], {
       cwd: job.dir,
+      signal: job.run?.signal,
       ...splittingProgress
     });
 
@@ -1740,10 +2008,12 @@ async function runYtDlpStrategies({ videoUrl, job, sendEvent, strategies, source
     try {
       await runCommand("yt-dlp", strategy.args, {
         cwd: job.dir,
+        signal: job.run?.signal,
         logPath: path.join(job.dir, "yt-dlp.log"),
         ...downloadProgress
       });
     } catch (error) {
+      if (job.run?.signal?.aborted) throw error;
       lastError = error;
       sendEvent({
         type: "status",
@@ -1954,7 +2224,7 @@ function formatYtDlpError(error, videoUrl) {
   return message;
 }
 
-async function transcribeChunk({ apiKey, chunkPath }) {
+async function transcribeChunk({ apiKey, chunkPath, signal }) {
   const videoBase64 = fs.readFileSync(chunkPath).toString("base64");
   const body = {
     model: ASR_MODEL_NAME,
@@ -1987,7 +2257,21 @@ async function transcribeChunk({ apiKey, chunkPath }) {
     stream: true
   };
 
-  const text = await callDashScopeChat(apiKey, body);
+  let text;
+  try {
+    text = await callDashScopeChat(apiKey, body, { signal });
+  } catch (error) {
+    // Whatever the HTTP client called it (AbortError, reset socket, half an SSE
+    // stream), an aborted run is a stop and must not look like a provider fault.
+    if (signal?.aborted) {
+      const reason = signal.reason;
+      throw error instanceof JobStoppedError ? error
+        : reason instanceof Error ? reason
+        : new JobStoppedError();
+    }
+    throw error;
+  }
+
   if (!text) {
     throw new Error("DashScope returned no transcript text.");
   }
@@ -1999,6 +2283,8 @@ async function transcribeChunkWithRetry({ apiKey, chunkPath, job, index, totalCh
   let lastError = null;
 
   for (let attempt = 1; attempt <= MAX_TRANSCRIBE_ATTEMPTS; attempt += 1) {
+    // A stop pressed while this chunk is queued must not start another request.
+    assertJobRunning(job);
     try {
       if (attempt > 1) {
         sendEvent({
@@ -2014,8 +2300,12 @@ async function transcribeChunkWithRetry({ apiKey, chunkPath, job, index, totalCh
         status: "transcribing",
         transcribeAttempt: attempt
       });
-      return await transcribeChunk({ apiKey, chunkPath });
+      return await transcribeChunk({ apiKey, chunkPath, signal: job?.run?.signal });
     } catch (error) {
+      // A stop is not a transient provider fault: never retry or sleep through it.
+      const stoppedError = stoppedJobError(job, error);
+      if (stoppedError) throw stoppedError;
+
       lastError = error;
       updateCheckpoint(job, {
         currentChunk: index,
@@ -2029,7 +2319,7 @@ async function transcribeChunkWithRetry({ apiKey, chunkPath, job, index, totalCh
         break;
       }
 
-      await delay(1000 * attempt);
+      await delay(1000 * attempt, job?.run?.signal);
     }
   }
 
@@ -2299,8 +2589,28 @@ function formatDashScopeDetail(data, fallback) {
   return parts.join("; ") || fallback;
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// With a run signal the wait is cancellable, so a stop pressed during the retry
+// backoff returns at once instead of blocking for seconds.
+function delay(ms, signal) {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason instanceof Error
+        ? signal.reason
+        : new Error(JOB_STOPPED_MESSAGE));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    // An abort that landed before the listener was armed still has to wake up.
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function createJob(videoUrl) {
@@ -2704,6 +3014,21 @@ function runCommand(command, args, options = {}) {
 
     let stdout = "";
     let stderr = "";
+    // A manual stop has to reach the running child process, not just the code
+    // that awaits it: kill on abort and report the stop instead of an exit code.
+    let stoppedByUser = false;
+    if (options.signal) {
+      const stopChild = () => {
+        stoppedByUser = true;
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // Process may have already exited.
+        }
+      };
+      if (options.signal.aborted) stopChild();
+      else options.signal.addEventListener("abort", stopChild, { once: true });
+    }
     // Progress is observational: a parser/listener failure must not escape an
     // EventEmitter callback or detach the still-running child from shutdown.
     const notifyOutput = (callback, ...values) => {
@@ -2745,6 +3070,12 @@ function runCommand(command, args, options = {}) {
         } catch {
           // Logging must never break the pipeline.
         }
+      }
+
+      if (stoppedByUser) {
+        const reason = options.signal?.reason;
+        reject(reason instanceof Error ? reason : new Error(`${command} 已被手动停止。`));
+        return;
       }
 
       if (code === 0) {

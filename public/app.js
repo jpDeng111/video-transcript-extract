@@ -33,6 +33,8 @@ const readingToc = document.querySelector("[data-reading-toc]");
 const readingSections = document.querySelector("[data-reading-sections]");
 const generateReadingButton = document.querySelector("[data-generate-reading]");
 const readingDownloadButton = document.querySelector("[data-download-reading]");
+const stopButton = document.querySelector("[data-stop]");
+const etaText = document.querySelector("[data-progress-eta]");
 
 let activeRequest = null;
 let activeJobId = "";
@@ -56,6 +58,15 @@ let readingPollTimer = null;
 let readingPollController = null;
 let readingPostController = null;
 let lastLegacyLog = { message: "", stage: "", at: -Infinity };
+// Server-measured remaining time for the stage currently running. Cleared
+// whenever the stage changes or the run stops, because a stale estimate reads
+// as a promise the app cannot keep.
+let eta = null;
+let stopFallbackTimer = null;
+// Per-video wall clock of a playlist run, used only for the batch-level estimate:
+// the average of the videos this run actually finished, times the ones left.
+let batchDurations = [];
+let batchVideoStartedAt = 0;
 
 // One injectable clock for progress only; network and UI event loops stay independent.
 const progressClock = {
@@ -160,6 +171,66 @@ function formatElapsed(ms) {
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
+function formatDuration(seconds) {
+  if (seconds >= 3600) {
+    const hours = Math.floor(seconds / 3600);
+    return `${hours} 小时 ${Math.round((seconds % 3600) / 60)} 分`;
+  }
+  return formatElapsed(seconds * 1000);
+}
+
+function formatClock(date) {
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+// A stage-progress event either carries a fresh estimate or proves the stage
+// has no denominator yet; silence must drop the old number, not keep it alive.
+function setEta(event) {
+  const seconds = Number.isFinite(event.etaSeconds) && event.etaSeconds > 0 ? Math.round(event.etaSeconds) : null;
+  eta = seconds === null || !event.stage
+    ? null
+    : { stage: event.stage, seconds, basis: event.etaBasis || "", at: progressClock.now() };
+}
+
+const etaBasisLabels = {
+  "chunk-rate": "按已完成分段均速",
+  "stage-rate": "按本阶段已完成比例",
+  "stage-time": "按本阶段已耗时"
+};
+
+function renderEta(state) {
+  const stageName = state.stage >= 0 ? progressStages[state.stage][0] : "";
+  const stageEta = eta && eta.stage === stageName && state.running
+    ? eta.seconds - (progressClock.now() - eta.at) / 1000
+    : null;
+  // In batch mode the user waits for the whole playlist, so add the videos that
+  // have not started yet on top of the current stage's remaining time. Waiting
+  // rows only: the running video is already covered by its own stage estimate.
+  const pendingVideos = batchMode && batchDurations.length
+    ? batchVideos.filter(video => video.state === "waiting").length
+    : 0;
+  if (stageEta === null && pendingVideos === 0) {
+    etaText.hidden = true;
+    etaText.textContent = "";
+    return;
+  }
+  const averageVideo = batchDurations.length
+    ? batchDurations.reduce((sum, value) => sum + value, 0) / batchDurations.length
+    : 0;
+  const remaining = Math.max(0, (stageEta || 0) + averageVideo * pendingVideos);
+  if (remaining <= 0) {
+    etaText.hidden = true;
+    etaText.textContent = "";
+    return;
+  }
+  const basis = pendingVideos
+    ? `合集剩余 ${pendingVideos} 个视频，按已完成 ${batchDurations.length} 个的平均耗时`
+    : etaBasisLabels[eta.basis] || "";
+  etaText.hidden = false;
+  etaText.textContent = `${pendingVideos ? "合集预计还需" : "预计还需"} ${formatDuration(remaining)} · 约 ${formatClock(new Date(progressClock.now() + remaining * 1000))} 完成`;
+  etaText.title = basis;
+}
+
 function progressDetail(state) {
   if (state.total) return `实际已完成 ${state.completed}/${state.total} ${state.label === "逐段转写" ? "段" : "批"}`;
   if (state.percent !== null) return `${state.scope === "file" ? "当前媒体流" : "当前阶段"}${state.estimated ? " · 估算" : " · 实际"} ${Math.floor(state.percent)}%`;
@@ -181,6 +252,7 @@ const overallProgress = createProgressTracker({ stages: progressStages, render(s
   document.querySelector("[data-progress-elapsed]").textContent = `已等待 ${formatElapsed(state.elapsed)}`;
   document.querySelector("[data-progress-detail]").textContent = progressDetail(state);
   document.querySelector("[data-progress-note]").textContent = progressNote(state);
+  renderEta(state);
   progressBar.parentElement.setAttribute("aria-label", label);
   progressBar.parentElement.setAttribute("aria-valuetext", `${state.value}%，${label}，${state.label}`);
   if (batchMode) renderBatchProgress(state.value);
@@ -281,6 +353,8 @@ for (const tab of viewTabs) {
 
 function resetDocument() {
   documentVersion += 1;
+  clearStopFallback();
+  eta = null;
   historyRequestId += 1;
   readingRequestId += 1;
   pendingReadingRequest = 0;
@@ -319,6 +393,8 @@ function syncDocumentUrl() {
   batchVideos = [];
   batchTotalVideos = 0;
   batchCompletedVideos = 0;
+  batchDurations = [];
+  batchVideoStartedAt = 0;
   batchVideoIndex = -1;
   batchFinished = false;
   setBatchProgress(0);
@@ -495,6 +571,42 @@ generateReadingButton.addEventListener("click", async () => {
   }
 });
 
+function clearStopFallback() {
+  if (stopFallbackTimer !== null) progressClock.clearTimeout(stopFallbackTimer);
+  stopFallbackTimer = null;
+}
+
+// A packaged build from before /api/stop exists cannot confirm the halt, so the
+// stream itself is the only thing left to close. Completed chunks stay on disk.
+function finishStopLocally() {
+  clearStopFallback();
+  if (!overallProgress.get().running) return;
+  activeRequest?.abort();
+}
+
+stopButton.addEventListener("click", async () => {
+  if (stopButton.disabled) return;
+  stopButton.disabled = true;
+  stopButton.textContent = "正在停止...";
+  setStatus("正在停止，请稍候...");
+  addLog("已发出停止请求：正在中断下载、转码与识别。");
+  // A batch owns one job per video and the prepare stage may not have reported a
+  // jobId yet, so the aggregate stop is the only request that always covers it.
+  const payload = batchMode || !activeJobId ? { all: true } : { jobId: activeJobId };
+  clearStopFallback();
+  stopFallbackTimer = progressClock.setTimeout(finishStopLocally, 6000);
+  try {
+    const response = await fetch("/api/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) finishStopLocally();
+  } catch {
+    finishStopLocally();
+  }
+});
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
 
@@ -510,6 +622,8 @@ form.addEventListener("submit", async (event) => {
   batchVideos = [];
   batchTotalVideos = 0;
   batchCompletedVideos = 0;
+  batchDurations = [];
+  batchVideoStartedAt = 0;
   batchVideoIndex = -1;
   batchFinished = false;
   batchPanel.hidden = true;
@@ -541,6 +655,7 @@ form.addEventListener("submit", async (event) => {
       batchMode = true;
       batchTotalVideos = checkData.count;
       batchCompletedVideos = 0;
+      batchDurations = [];
       batchVideos = (checkData.entries || []).map((e, i) => ({
         index: i, title: e.title, url: e.url, state: "waiting", jobId: ""
       }));
@@ -600,6 +715,7 @@ form.addEventListener("submit", async (event) => {
     setStatus(message);
     addLog(message, error.name === "AbortError" ? "" : "error");
   } finally {
+    clearStopFallback();
     if (activeRequest === request) {
       activeRequest = null;
       setBusy(false);
@@ -644,6 +760,25 @@ function handleEvent(event) {
   if (["batch-video-done", "batch-video-error"].includes(event.type) && event.videoIndex !== batchVideoIndex) return;
   // Stream updates supersede any earlier history snapshot.
   historyRequestId += 1;
+  if (event.type === "stopped") {
+    // The server confirms the stop only after its child processes are gone, so
+    // this event — not the local fetch abort — is what ends the run.
+    clearStopFallback();
+    eta = null;
+    batchFinished = true;
+    if (overallProgress.get().running) overallProgress.finish(false);
+    if (readingProgress.get().running) readingProgress.finish(false);
+    stopBatchAnimation();
+    setStatusKind("idle");
+    setStatus(event.message || "已手动停止，已完成的部分都保留在本地。");
+    addLog("已停止处理，已完成的分段保存在本地，重新提交同一链接会从断点继续。", "");
+    flushChunkNotify();
+    // Release the form immediately: a server that keeps the stream open while its
+    // children wind down must not leave the UI stuck on "正在停止...".
+    activeRequest = null;
+    setBusy(false);
+    return;
+  }
   if (event.type === "stage-progress") {
     if (!overallProgress.get().running) return;
     if (event.jobId) activeJobId = event.jobId;
@@ -651,6 +786,7 @@ function handleEvent(event) {
     overallProgress.update(event);
     const current = overallProgress.get();
     if (progressStages[current.stage]?.[0] !== event.stage) return;
+    setEta(event);
     if (current.stage !== previousStage) setStatus(`正在${current.label}，请稍候。`);
     summaryStatus.textContent = current.label;
     if (event.stage === "transcribe" && current.total) {
@@ -699,6 +835,7 @@ function handleEvent(event) {
   if (event.type === "batch-video-start") {
     if (batchFinished || event.videoIndex <= batchVideoIndex) return;
     batchVideoIndex = event.videoIndex;
+    batchVideoStartedAt = progressClock.now();
     stopBatchAnimation();
     resetDocument();
     overallProgress.start();
@@ -716,6 +853,8 @@ function handleEvent(event) {
 
   if (event.type === "batch-video-done") {
     updateBatchVideo(event.videoIndex, { state: "done", jobId: event.jobId });
+    if (batchVideoStartedAt) batchDurations.push(progressClock.now() - batchVideoStartedAt);
+    batchVideoStartedAt = 0;
     overallProgress.finish(true);
     flushChunkNotify();
     notifyDesktop("合集进度", event.message || "一个视频已完成。");
@@ -728,6 +867,7 @@ function handleEvent(event) {
 
   if (event.type === "batch-video-error") {
     updateBatchVideo(event.videoIndex, { state: "error" });
+    batchVideoStartedAt = 0; // A failed video says nothing about the average length.
     overallProgress.finish(false);
     if (readingProgress.get().running) applyReadingState({ readingStatus: "failed", readingError: "处理已中断，请重试主题整理。" });
     setStatusKind("error");
@@ -833,6 +973,9 @@ function setBusy(isBusy) {
   urlInput.disabled = isBusy;
   checkStatusButton.disabled = isBusy;
   submitButton.textContent = isBusy ? "处理中..." : "提取并转写";
+  stopButton.hidden = !isBusy;
+  stopButton.disabled = false;
+  stopButton.textContent = "停止处理";
 }
 
 function setStatus(message) {

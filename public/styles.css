@@ -192,6 +192,25 @@ button:hover:not(:disabled) {
   background: rgba(23, 107, 91, 0.14);
 }
 
+/* The stop control sits in the status panel and only appears while a job runs,
+   so it is styled as a warning rather than the primary accent action. */
+.stop-button {
+  width: 100%;
+  margin-top: 14px;
+  border: 1px solid rgba(198, 83, 56, 0.34);
+  background: rgba(198, 83, 56, 0.08);
+  color: var(--clay);
+}
+
+.stop-button:hover:not(:disabled) {
+  background: rgba(198, 83, 56, 0.16);
+  color: var(--clay);
+}
+
+.stop-button:disabled {
+  cursor: progress;
+}
+
 .hint,
 .path-line,
 .panel-heading span {

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>视频转写问答</title>
-    <link rel="stylesheet" href="/styles.css?v=percent-progress-v1">
+    <link rel="stylesheet" href="/styles.css?v=stop-eta-v1">
   </head>
   <body>
     <main class="shell">
@@ -32,7 +32,7 @@
           </div>
           <div class="progress-readout">
             <div><p class="progress-label" data-progress-label>总进度 · 估算</p><div class="progress-number"><span data-progress-percent>0</span><span class="percent-sign">%</span></div></div>
-            <div class="progress-context"><strong data-progress-stage>等待开始</strong><span data-progress-elapsed>已等待 00:00</span></div>
+            <div class="progress-context"><strong data-progress-stage>等待开始</strong><span data-progress-elapsed>已等待 00:00</span><span data-progress-eta hidden></span></div>
           </div>
           <div class="progress" role="progressbar" aria-label="总进度 · 估算" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-describedby="progress-note">
             <span data-progress></span>
@@ -54,6 +54,7 @@
             </div>
           </dl>
           <p class="path-line">本地结果：<span data-transcript-path>尚未生成</span></p>
+          <button class="stop-button" data-stop type="button" hidden>停止处理</button>
         </section>
 
         <section class="panel batch-panel" aria-label="合集进度" data-batch-panel hidden>
@@ -139,6 +140,6 @@
         </section>
       </section>
     </main>
-    <script src="/app.js?v=percent-progress-v1"></script>
+    <script src="/app.js?v=stop-eta-v1"></script>
   </body>
 </html>
