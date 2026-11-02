@@ -38,6 +38,8 @@ const API_BASE_URL = String(
 ).replace(/\/+$/, "");
 
 const YTDLP_EXTRA_ARGS = parseShellArgs(process.env.YTDLP_EXTRA_ARGS || "");
+const YTDLP_MAX_HEIGHT = boundedDownloadSetting(process.env.YTDLP_MAX_HEIGHT, 480, 144, 2160);
+const YTDLP_CONCURRENT_FRAGMENTS = boundedDownloadSetting(process.env.YTDLP_CONCURRENT_FRAGMENTS, 4, 1, 16);
 fs.mkdirSync(JOBS_ROOT, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const PORT = Number(process.env.PORT || 3000);
@@ -1306,7 +1308,6 @@ function handleDownload(url, res) {
 }
 
 async function prepareAudio(videoUrl, job, sendEvent) {
-  const existingMetadata = readJsonFile(job.metadataPath);
   let existingSourcePath = findFirstFile(job.dir, /^source\.(m4a|mp3|webm|mp4|mkv|mov|m4v|wav|aac|opus)$/i);
 
   if (fs.existsSync(job.audioPath) && await isValidMediaFile(job.audioPath, { requireCompleteContent: true })) {
@@ -1316,8 +1317,7 @@ async function prepareAudio(videoUrl, job, sendEvent) {
       message: "找到已有规范化音频，跳过下载。"
     });
     return {
-      title: existingMetadata.title || (await fetchVideoInfo(videoUrl)).title,
-      uploader: existingMetadata.uploader || (await fetchVideoInfo(videoUrl)).uploader,
+      ...await getJobVideoInfo(videoUrl, job),
       sourcePath: existingSourcePath,
       audioPath: job.audioPath
     };
@@ -1398,7 +1398,7 @@ async function prepareAudio(videoUrl, job, sendEvent) {
   }
 
   fs.renameSync(normalizedTmpPath, job.audioPath);
-  const videoInfo = existingMetadata.title ? { title: existingMetadata.title, uploader: existingMetadata.uploader || "" } : await fetchVideoInfo(videoUrl);
+  const videoInfo = await getJobVideoInfo(videoUrl, job);
   return {
     title: videoInfo.title,
     uploader: videoInfo.uploader,
@@ -1704,7 +1704,6 @@ function sendTranscribeProgress(job, total, sendEvent) {
 }
 
 async function downloadVideo(videoUrl, job, sendEvent) {
-  const existingMetadata = readJsonFile(job.metadataPath);
   let existingSourcePath = findFirstFile(job.dir, /^source\.(mp4|mkv|webm|mov|m4v)$/i);
   sendStageProgress(job, sendEvent, "download", { percent: null });
 
@@ -1717,8 +1716,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
       message: "Found existing normalized video, skipping download."
     });
     return {
-      title: existingMetadata.title || (await fetchVideoInfo(videoUrl)).title,
-      uploader: existingMetadata.uploader || (await fetchVideoInfo(videoUrl)).uploader,
+      ...await getJobVideoInfo(videoUrl, job),
       sourcePath: existingSourcePath,
       videoPath: job.normalizedPath
     };
@@ -1823,7 +1821,7 @@ async function downloadVideo(videoUrl, job, sendEvent) {
 
   fs.renameSync(normalizedTmpPath, job.normalizedPath);
   sendStageProgress(job, sendEvent, "normalize", { percent: 100 });
-  const videoInfo = existingMetadata.title ? { title: existingMetadata.title, uploader: existingMetadata.uploader || "" } : await fetchVideoInfo(videoUrl);
+  const videoInfo = await getJobVideoInfo(videoUrl, job);
   return {
     title: videoInfo.title,
     uploader: videoInfo.uploader,
@@ -1991,7 +1989,10 @@ async function runYtDlpStrategies({ videoUrl, job, sendEvent, strategies, source
   let lastError = null;
   let incompleteCount = 0;
 
-  for (const strategy of strategies) {
+  for (let strategyIndex = 0; strategyIndex < strategies.length; strategyIndex++) {
+    const strategy = strategies[strategyIndex];
+    // --print-to-file appends; don't reuse metadata from a failed attempt.
+    removeFileIfExists(path.join(job.dir, "download-info.json"));
     sendEvent({
       type: "status",
       step: "download",
@@ -2047,14 +2048,16 @@ async function runYtDlpStrategies({ videoUrl, job, sendEvent, strategies, source
         step: "download_retry",
         message: `${strategy.name} returned an incomplete file, trying next download strategy...`
       });
+      // Changing TLS/IP still fetches the same broken representation. Jump
+      // straight to the next extraction path instead of downloading it again.
+      const differentExtractionIndex = strategies.findIndex((next, index) =>
+        index > strategyIndex && next.changesExtraction);
+      if (differentExtractionIndex !== -1) {
+        strategyIndex = differentExtractionIndex - 1;
+        continue;
+      }
       if (incompleteCount >= 2) {
-        // Two header-only stubs in a row means the platform is handing back the
-        // same broken stream; re-fetching it would only burn the user's
-        // bandwidth — unless a later strategy changes the extraction path.
-        const hasDifferentExtraction = strategies
-          .slice(strategies.indexOf(strategy) + 1)
-          .some((next) => next.changesExtraction);
-        if (!hasDifferentExtraction) break;
+        break;
       }
       continue;
     }
@@ -2073,16 +2076,23 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
     "--no-playlist",
     "--newline",
     "--progress",
+    "--concurrent-fragments",
+    String(YTDLP_CONCURRENT_FRAGMENTS),
+    "--abort-on-unavailable-fragments",
     "--retries",
-    "5",
+    "3",
     "--fragment-retries",
-    "5",
+    "3",
     "--extractor-retries",
-    "5",
+    "2",
     "--retry-sleep",
     "linear=1::3",
     "--socket-timeout",
-    "30",
+    "15",
+    "--print-to-file",
+    'after_move:{"title":%(title)j,"uploader":%(uploader)j}',
+    path.join(path.dirname(outputTemplate), "download-info.json"),
+    "--no-simulate",
     "--output",
     outputTemplate,
     ...platformArgs,
@@ -2090,14 +2100,18 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
   ];
 
   if (options.audioOnly) {
-    baseArgs.unshift("-f", "ba[protocol=https]/ba/bestaudio");
+    baseArgs.unshift("-f", "ba[protocol=https]/ba/bestaudio", "-S", "abr:64");
   } else {
-    // Prefer https (progressive/DASH) over m3u8: HLS fragment downloads are
-    // far more fragile over slow/unstable connections, and degraded YouTube
-    // extractions sometimes expose only m3u8 plus one low-res https format.
+    // Transcription normalizes to 640px wide. Avoid downloading 4K/8K just
+    // to discard almost every pixel; prefer a capped stream on any protocol
+    // before falling back to the closest available resolution above the cap.
+    const capped = `[height<=${YTDLP_MAX_HEIGHT}]`;
     baseArgs.unshift(
       "-f",
-      "bv*[protocol=https]+ba[protocol=https]/b[protocol=https]/bv*+ba/b",
+      `bv*${capped}[protocol=https]+ba[protocol=https]/b${capped}[protocol=https]/` +
+      `bv*${capped}+ba/b${capped}/bv*+ba/b`,
+      "-S",
+      `res:${YTDLP_MAX_HEIGHT},fps:30,abr:64`,
       "--merge-output-format",
       "mp4"
     );
@@ -2106,7 +2120,7 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
   const strategies = [
     {
       name: "default",
-      label: options.audioOnly ? "正在下载最佳音频..." : "Downloading video with yt-dlp..."
+      label: options.audioOnly ? "正在下载转写所需音频..." : `正在下载转写视频（优先 ≤${YTDLP_MAX_HEIGHT}p，${YTDLP_CONCURRENT_FRAGMENTS} 路分片并发）...`
     },
     {
       name: "ipv4",
@@ -2132,8 +2146,8 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
     // "100% of 2.27MiB" and exits 0 while the moov box claims 79 minutes.
     // Asking anonymously for the default player client instead returns real
     // DASH representations (verified: 108.7MB / 4751s for nBor4jfWetQ).
-    // The height cap keeps this fallback the same size as the formats the
-    // other strategies get, since transcription never needs 1080p.
+    // Keep the fallback capped too, with a general codec/protocol fallback
+    // for videos that do not offer low-resolution H.264 DASH.
     strategies.push({
       name: "youtube_dash_without_cookies",
       label: options.audioOnly
@@ -2147,8 +2161,9 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
         : [
           "--extractor-args", "youtube:player_client=default",
           "-f",
-          "bv*[protocol=https][ext=mp4][vcodec^=avc1][height<=360]" +
-          "+ba[protocol=https][ext=m4a]/b[protocol=https][height<=360]"
+          `bv*[protocol=https][ext=mp4][vcodec^=avc1][height<=${YTDLP_MAX_HEIGHT}]` +
+          `+ba[protocol=https][ext=m4a]/b[protocol=https][height<=${YTDLP_MAX_HEIGHT}]/` +
+          baseArgs[baseArgs.indexOf("-f") + 1]
         ],
       skipCookies: true,
       changesExtraction: true
@@ -2163,6 +2178,11 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
       videoUrl
     ]
   }));
+}
+
+function boundedDownloadSetting(value, fallback, min, max) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
 }
 
 // yt-dlp cannot be told to "un-set" a cookie jar with an empty value, so the
@@ -2884,7 +2904,19 @@ async function isValidMediaFile(filePath, options = {}) {
   return (await validateMediaFile(filePath, options)).ok;
 }
 
-async function fetchVideoInfo(videoUrl) {
+async function getJobVideoInfo(videoUrl, job) {
+  // Capture only title/uploader during the download, avoiding another webpage
+  // extraction, cookie scan and proxy handshake after normalization.
+  for (const filePath of [job.metadataPath, path.join(job.dir, "download-info.json")]) {
+    const info = readJsonFile(filePath);
+    if (typeof info?.title === "string" && info.title) {
+      return { title: info.title, uploader: typeof info.uploader === "string" ? info.uploader : "" };
+    }
+  }
+  return fetchVideoInfo(videoUrl, job.run?.signal);
+}
+
+async function fetchVideoInfo(videoUrl, signal) {
   try {
     const platform = detectPlatform(videoUrl);
     const platformArgs = getPlatformArgs(platform);
@@ -2892,15 +2924,19 @@ async function fetchVideoInfo(videoUrl) {
       "--print",
       "%(title)s\n%(uploader)s",
       "--no-playlist",
+      "--socket-timeout", "15",
+      "--extractor-retries", "2",
       ...platformArgs,
+      ...YTDLP_EXTRA_ARGS,
       videoUrl
-    ]);
+    ], { signal });
     const lines = output.trim().split("\n");
     return {
       title: lines[0] || "Untitled Video",
       uploader: lines[1] || ""
     };
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return { title: "Untitled Video", uploader: "" };
   }
 }

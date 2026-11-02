@@ -68,8 +68,8 @@ test('only YouTube gets the extra cookie-free DASH strategy', () => {
     'the fallback must not re-send the cookie jar that produced the truncated format list');
   assert.match(joined, /player_client=default/);
   // The later -f wins, so the DASH selector has to come after the base selector.
-  assert.deepEqual(last.args.filter((item, index) => last.args[index - 1] === '-f').at(-1),
-    'bv*[protocol=https][ext=mp4][vcodec^=avc1][height<=360]+ba[protocol=https][ext=m4a]/b[protocol=https][height<=360]');
+  assert.match(last.args.filter((item, index) => last.args[index - 1] === '-f').at(-1),
+    /^bv\*\[protocol=https\]\[ext=mp4\]\[vcodec\^=avc1\]\[height<=480\]/);
   assert.equal(youtube.slice(0, -1).every(strategy =>
     strategy.args.includes('--cookies-from-browser')), true);
   assert.equal(last.args.at(-1), 'https://www.youtube.com/watch?v=nBor4jfWetQ');
@@ -151,12 +151,9 @@ test('a truncated cookie download is retried until the anonymous DASH strategy s
   assert.equal(path.basename(source), 'source.mp4');
   assert.equal(fs.statSync(source).size, fs.statSync(fixtures.full).size,
     'the accepted file must be the complete download, not the truncated stub');
-  assert.equal(retries(events).length, 4, 'each cookie strategy must report the truncated stub');
+  assert.equal(retries(events).length, 1, 'a truncated cookie stream must skip redundant TLS/IP retries');
   assert.match(retries(events).at(-1).message, /incomplete file/);
   assert.deepEqual(service.calls(), [
-    { anonymous: false, dash: false },
-    { anonymous: false, dash: false },
-    { anonymous: false, dash: false },
     { anonymous: false, dash: false },
     { anonymous: true, dash: true }
   ]);
@@ -168,18 +165,14 @@ test('a stream that is broken for every strategy still stops without leaving the
   const service = isolatedServer(t, { stubEverywhere: true });
   const { job, events, promise } = service.download('https://www.youtube.com/watch?v=nBor4jfWetQ');
 
-  // A truncated stub only costs the few megabytes YouTube actually sends, so the
-  // loop keeps going while a genuinely different extraction path is still
-  // untried — and then stops instead of looping forever on a known-broken stream.
+  // Try the genuinely different extraction path immediately, then stop if
+  // it too returns a stub instead of re-fetching the same representation.
   await assert.rejects(promise, /stopped early/);
-  assert.equal(retries(events).length, 5);
+  assert.equal(retries(events).length, 2);
   assert.match(retries(events).at(-1).message, /incomplete file/);
   assert.equal(fs.existsSync(path.join(job.dir, 'source.mp4')), false,
     'a rejected stub must never be left for the next run to trust');
   assert.deepEqual(service.calls(), [
-    { anonymous: false, dash: false },
-    { anonymous: false, dash: false },
-    { anonymous: false, dash: false },
     { anonymous: false, dash: false },
     { anonymous: true, dash: true }
   ]);
