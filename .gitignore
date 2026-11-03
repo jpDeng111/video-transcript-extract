@@ -6,3 +6,8 @@ tmp
 jobs
 .DS_Store
 .qoder
+
+# Local agent notes and business/strategy documents. This repository is public,
+# and these files contain pricing plans and personal context.
+.workbuddy/
+reports/

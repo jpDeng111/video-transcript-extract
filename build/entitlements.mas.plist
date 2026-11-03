@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Mac App Store builds must be sandboxed. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<!-- Download audio from video platforms + call the ASR/LLM APIs. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+
+	<!-- User picks the cookies.txt and the export folder through NSOpenPanel. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+	<key>com.apple.security.files.bookmarks.app-scope</key>
+	<true/>
+
+	<!-- Keep the chosen output folder across launches. -->
+	<key>com.apple.security.files.bookmarks.document-scope</key>
+	<true/>
+</dict>
+</plist>

@@ -8,7 +8,10 @@
     "desktop": "electron .",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
-    "dist:local": "electron-builder --config.mac.timestamp=none"
+    "dist:local": "electron-builder --config.mac.timestamp=none",
+    "dist:mas": "electron-builder --mac mas",
+    "fetch:binaries": "bash scripts/fetch-binaries.sh",
+    "check:mas": "node scripts/mas-preflight.js"
   },
   "build": {
     "appId": "local.video-script-extract",
@@ -31,13 +34,35 @@
       "!.git/**/*",
       "!.qoder/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "assets/icon.icns",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.darwin.plist",
+      "entitlementsInherit": "build/entitlements.darwin.plist",
       "target": [
         "dmg",
         "zip"
       ]
+    },
+    "mas": {
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": false,
+      "entitlements": "build/entitlements.mas.plist",
+      "entitlementsInherit": "build/entitlements.mas.inherit.plist",
+      "provisioningProfile": "build/embedded.provisionprofile",
+      "artifactName": "${productName}-${version}-mas.${ext}",
+      "type": "distribution"
     },
     "directories": {
       "output": "dist"

@@ -12,7 +12,16 @@ function getIconPath() {
 }
 
 function extendPathForDesktopLaunch() {
+  // Bundled tools first: a packaged .app launched from Finder inherits a
+  // minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so Homebrew paths only help
+  // developers. Under the Mac App Store sandbox they are unreachable anyway.
+  const bundledBin = path.join(process.resourcesPath || path.join(app.getAppPath(), ".."), "bin");
+  if (fs.existsSync(bundledBin)) {
+    process.env.APP_BIN_DIR = bundledBin;
+  }
+
   const additions = [
+    bundledBin,
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
     "/usr/local/bin",
@@ -22,7 +31,7 @@ function extendPathForDesktopLaunch() {
   const paths = current.split(path.delimiter).filter(Boolean);
 
   for (const item of additions.reverse()) {
-    if (!paths.includes(item)) {
+    if (item && !paths.includes(item)) {
       paths.unshift(item);
     }
   }
@@ -45,7 +54,8 @@ function ensureConfigFiles(userDataDir) {
           "ASR_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1",
           "ASR_MODEL=qwen-audio-3.1-asr-flash",
           "DASHSCOPE_CHAT_MODEL=qwen3.7-plus",
-          "YTDLP_EXTRA_ARGS="
+          "YTDLP_EXTRA_ARGS=",
+          "YTDLP_COOKIES_FILE="
         ].join("\n");
 
     fs.writeFileSync(envPath, template.endsWith("\n") ? template : `${template}\n`, "utf8");
@@ -95,6 +105,48 @@ function createWindow(url) {
   });
 }
 
+function writeEnvValue(userDataDir, key, value) {
+  const envPath = path.join(userDataDir, ".env");
+  const lines = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8").split("\n") : [];
+  const prefix = `${key}=`;
+  let replaced = false;
+  const next = lines.map((line) => {
+    if (line.startsWith(prefix)) {
+      replaced = true;
+      return `${prefix}${value}`;
+    }
+    return line;
+  });
+  if (!replaced) next.push(`${prefix}${value}`);
+  fs.writeFileSync(envPath, `${next.join("\n").replace(/\n+$/, "")}\n`, "utf8");
+}
+
+// The App Sandbox cannot read Chrome's cookie database, so a user-exported
+// Netscape cookies.txt picked through an open panel is the only supported
+// cookie source in the Mac App Store build.
+async function pickCookiesFile() {
+  const result = await dialog.showOpenDialog({
+    title: "选择 cookies.txt（Netscape 格式）",
+    message: "在浏览器扩展（如 Get cookies.txt LOCALLY）里导出后选择该文件。",
+    properties: ["openFile"],
+    filters: [{ name: "Cookies", extensions: ["txt"] }]
+  });
+  if (result.canceled || !result.filePaths[0]) return;
+
+  writeEnvValue(app.getPath("userData"), "YTDLP_COOKIES_FILE", result.filePaths[0]);
+  const restart = await dialog.showMessageBox({
+    type: "question",
+    buttons: ["稍后", "立即重启"],
+    defaultId: 1,
+    message: "cookies 文件已保存，重启应用后生效。",
+    detail: result.filePaths[0]
+  });
+  if (restart.response === 1) {
+    app.relaunch();
+    app.exit(0);
+  }
+}
+
 function buildMenu() {
   const userDataDir = app.getPath("userData");
   const jobsDir = path.join(userDataDir, "jobs");
@@ -112,6 +164,11 @@ function buildMenu() {
         {
           label: "打开文稿目录",
           click: () => shell.openPath(jobsDir)
+        },
+        { type: "separator" },
+        {
+          label: "选择 cookies 文件…",
+          click: () => pickCookiesFile()
         },
         { type: "separator" },
         { role: "quit", label: "退出" }

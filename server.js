@@ -5,6 +5,16 @@ const crypto = require("crypto");
 const { spawn } = require("child_process");
 const { createReadingDocument, getTranscriptHash, toReadingMarkdown } = require("./lib/transcript-reading");
 const { createYtDlpProgress, createFfmpegProgress, countProgress } = require("./lib/process-progress");
+const {
+  resolveBinary,
+  findBinary,
+  binaryReport,
+  getCookieArgs,
+  applyCookiePolicy,
+  IS_SANDBOXED,
+  IS_MAS,
+  runtimeMode
+} = require("./lib/runtime");
 
 const ROOT_DIR = __dirname;
 loadEnvFile(path.join(ROOT_DIR, ".env"));
@@ -39,7 +49,7 @@ const API_BASE_URL = String(
   process.env.DASHSCOPE_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1"
 ).replace(/\/+$/, "");
 
-const YTDLP_EXTRA_ARGS = parseShellArgs(process.env.YTDLP_EXTRA_ARGS || "");
+const YTDLP_EXTRA_ARGS = applyCookiePolicy(parseShellArgs(process.env.YTDLP_EXTRA_ARGS || ""));
 const YTDLP_MAX_HEIGHT = boundedDownloadSetting(process.env.YTDLP_MAX_HEIGHT, 480, 144, 2160);
 const YTDLP_CONCURRENT_FRAGMENTS = boundedDownloadSetting(process.env.YTDLP_CONCURRENT_FRAGMENTS, 4, 1, 16);
 fs.mkdirSync(JOBS_ROOT, { recursive: true });
@@ -62,20 +72,25 @@ function detectPlatform(videoUrl) {
 }
 
 function getPlatformArgs(platform) {
+  // Cookie source differs per distribution channel: a browser cookie jar in
+  // dev/direct builds, a user-exported cookies.txt (or nothing) under the
+  // App Sandbox. See lib/runtime.js.
+  const cookieArgs = getCookieArgs();
   switch (platform) {
     case "bilibili":
-      return parseShellArgs(
-        "--no-update --cookies-from-browser chrome " +
-        "--user-agent Mozilla/5.0 " +
-        "--referer https://www.bilibili.com/ " +
-        "--add-headers Accept-Language:zh-CN,zh;q=0.9,en;q=0.8"
-      );
+      return [
+        ...parseShellArgs(
+          "--no-update " +
+          "--user-agent Mozilla/5.0 " +
+          "--referer https://www.bilibili.com/ " +
+          "--add-headers Accept-Language:zh-CN,zh;q=0.9,en;q=0.8"
+        ),
+        ...cookieArgs
+      ];
     case "youtube":
-      return parseShellArgs("--cookies-from-browser chrome");
     case "douyin":
-      return parseShellArgs("--cookies-from-browser chrome");
     default:
-      return parseShellArgs("--cookies-from-browser chrome");
+      return [...cookieArgs];
   }
 }
 
@@ -584,7 +599,21 @@ async function handleTranscribe(req, res) {
       transcriptPath: job.transcriptPath
     });
 
-    for (let index = 0; index < chunks.length; index += 1) {
+    // ASR is a hosted API call: wall time is per-request latency, not local
+    // CPU. A 48-minute video is 24 chunks, and doing them one at a time is 24
+    // sequential ~55s round trips (~22 minutes). A bounded pool stays far below
+    // the model's 600 RPM limit and turns that stage into a few minutes.
+    const asrConcurrency = Math.max(
+      1,
+      Math.min(8, Number(process.env.ASR_CONCURRENCY) || 4)
+    );
+    if (job.run) {
+      job.run.asrConcurrency = asrConcurrency;
+    }
+    // Everything after the model call is synchronous, so two finished chunks
+    // can never interleave their result / transcript / checkpoint writes.
+    // Only the awaited request is shared, which is why no lock is needed.
+    const runChunk = async (index) => {
       assertJobRunning(job);
       sendTranscribeProgress(job, chunks.length, sendEvent);
       const chunkPath = chunks[index];
@@ -614,17 +643,17 @@ async function handleTranscribe(req, res) {
           type: "status",
           step: "resume",
           message: `跳过已完成音频段 ${index + 1}/${chunks.length}。`,
-          progress: Math.round(((index + 1) / chunks.length) * 100)
+          progress: Math.round((countCompletedChunks(job, chunks.length) / chunks.length) * 100)
         });
         sendTranscribeProgress(job, chunks.length, sendEvent);
-        continue;
+        return;
       }
 
       sendEvent({
         type: "status",
         step: "transcribing",
         message: `正在识别音频段 ${index + 1}/${chunks.length}...`,
-        progress: Math.round((index / chunks.length) * 100)
+        progress: Math.round((countCompletedChunks(job, chunks.length) / chunks.length) * 100)
       });
       updateCheckpoint(job, {
         id: job.id,
@@ -675,9 +704,35 @@ async function handleTranscribe(req, res) {
         type: "status",
         step: "saved",
         message: `已保存音频段 ${index + 1}/${chunks.length} 到 transcript.txt。`,
-        progress: Math.round(((index + 1) / chunks.length) * 100)
+        progress: Math.round((countCompletedChunks(job, chunks.length) / chunks.length) * 100)
       });
       sendTranscribeProgress(job, chunks.length, sendEvent);
+    };
+
+    let nextChunkIndex = 0;
+    let firstChunkError = null;
+    const lanes = Math.max(1, Math.min(asrConcurrency, chunks.length));
+    await Promise.all(
+      Array.from({ length: lanes }, async () => {
+        while (!firstChunkError) {
+          const index = nextChunkIndex;
+          nextChunkIndex += 1;
+          if (index >= chunks.length) {
+            return;
+          }
+          try {
+            await runChunk(index);
+          } catch (error) {
+            // Keep the first failure. Chunks this run already finished stay on
+            // disk, so a retry resumes instead of paying for them again.
+            firstChunkError = firstChunkError || error;
+          }
+        }
+      })
+    );
+
+    if (firstChunkError) {
+      throw firstChunkError;
     }
 
     const finalText = readTextFile(job.transcriptPath).trim();
@@ -1578,7 +1633,10 @@ function estimateStageEta(run, progress) {
     // transcription rate to the reading batches would claim minutes per batch.
     if (run.stage === "transcribe" && run.chunkDurations.length) {
       const average = run.chunkDurations.reduce((sum, value) => sum + value, 0) / run.chunkDurations.length;
-      return { etaSeconds: Math.round(average * remaining / 1000), etaBasis: "chunk-rate" };
+      // Chunks now run in parallel, so the wait is latency over lanes, not
+      // latency times the remaining count. Defaults to 1 for older runs.
+      const lanes = Number(run.asrConcurrency) > 0 ? Number(run.asrConcurrency) : 1;
+      return { etaSeconds: Math.round(average * remaining / lanes / 1000), etaBasis: "chunk-rate" };
     }
     if (completed > 0) {
       const elapsed = Math.max(0, now - run.stageStartedAt);
@@ -2585,7 +2643,17 @@ function buildPublicConfig() {
       baseUrl: ASR_BASE_URL,
       model: ASR_MODEL_NAME
     },
-    ytdlpExtraArgsConfigured: YTDLP_EXTRA_ARGS.length > 0
+    ytdlpExtraArgsConfigured: YTDLP_EXTRA_ARGS.length > 0,
+    runtime: {
+      mode: runtimeMode(),
+      sandboxed: IS_SANDBOXED,
+      mas: IS_MAS,
+      // The UI can show a "missing dependency" state instead of a cryptic
+      // yt-dlp ENOENT on the first run.
+      binariesReady: binaryReport().every((item) => item.ok),
+      binaries: binaryReport().map(({ name, ok, source }) => ({ name, ok, source })),
+      cookiesSource: getCookieArgs().length ? getCookieArgs()[0] : "none"
+    }
   };
 }
 
@@ -3055,31 +3123,33 @@ async function getMediaDuration(mediaPath) {
 
 function assertRequiredCommands(commands) {
   for (const command of commands) {
-    if (!findCommandInPath(command)) {
-      throw new Error(`Missing required command: ${command}. Please install it first.`);
+    if (!findBinary(command)) {
+      throw new Error(
+        `Missing required command: ${command}. ` +
+        (IS_SANDBOXED
+          ? "This build ships its own copy in Contents/Resources/bin — the app bundle is incomplete, please reinstall."
+          : "Please install it first (brew install yt-dlp ffmpeg).")
+      );
     }
   }
 }
 
+// Kept for callers/tests that expect a path-or-empty-string answer.
 function findCommandInPath(command) {
-  const pathValue = process.env.PATH || "";
-  for (const directory of pathValue.split(path.delimiter)) {
-    const fullPath = path.join(directory, command);
-    if (fs.existsSync(fullPath)) {
-      return fullPath;
-    }
-  }
-  return "";
+  return findBinary(command);
 }
 
 function runCommand(command, args, options = {}) {
+  // Always spawn the absolute path: a packaged .app has a minimal PATH and
+  // /opt/homebrew/bin is not in it unless the user's shell is involved.
+  const executable = resolveBinary(command);
   return new Promise((resolve, reject) => {
     if (shuttingDown) {
       reject(new Error(`${command} skipped: server is shutting down.`));
       return;
     }
 
-    const child = spawn(command, args, {
+    const child = spawn(executable, args, {
       // APP_DATA_DIR, not ROOT_DIR: in the packaged app ROOT_DIR lives inside
       // app.asar, which is not a real directory and makes spawn fail ENOENT.
       cwd: options.cwd || APP_DATA_DIR,

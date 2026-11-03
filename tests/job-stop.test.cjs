@@ -95,6 +95,10 @@ test('the remaining-time estimate comes from the chunks this run really measured
   assert.deepEqual(plain(service.estimateStageEta(run, { completed: 0, total: 3 })), {});
   run.chunkDurations.push(4000, 4000);
   assert.deepEqual(plain(service.estimateStageEta(run, { completed: 2, total: 3 })), { etaSeconds: 4, etaBasis: 'chunk-rate' });
+  // Chunks run in parallel now, so the wait is latency over lanes, not latency
+  // times the remaining count.
+  assert.deepEqual(plain(service.estimateStageEta({ ...run, asrConcurrency: 4 }, { completed: 2, total: 3 })),
+    { etaSeconds: 1, etaBasis: 'chunk-rate' });
   // A measured chunk rate only describes the stage that measured it.
   const reading = { ...run, stage: 'reading' };
   assert.equal(plain(service.estimateStageEta(reading, { completed: 2, total: 3 })).etaBasis, 'stage-rate');
@@ -166,7 +170,7 @@ test('stop mid-request ends the stream as stopped and keeps the finished chunks'
   });
   await new Promise((resolve) => model.listen(0, '127.0.0.1', resolve));
 
-  const previousEnv = ['APP_DATA_DIR', 'DASHSCOPE_BASE_URL', 'DASHSCOPE_API_KEY', 'ASR_MODEL', 'ASR_API_KEY', 'ASR_BASE_URL', 'DASHSCOPE_CHAT_MODEL', 'PATH']
+  const previousEnv = ['APP_DATA_DIR', 'DASHSCOPE_BASE_URL', 'DASHSCOPE_API_KEY', 'ASR_MODEL', 'ASR_API_KEY', 'ASR_BASE_URL', 'DASHSCOPE_CHAT_MODEL', 'PATH', 'ASR_CONCURRENCY']
     .map((key) => [key, process.env[key]]);
   process.env.APP_DATA_DIR = root;
   process.env.DASHSCOPE_BASE_URL = `http://127.0.0.1:${model.address().port}`;
@@ -175,6 +179,10 @@ test('stop mid-request ends the stream as stopped and keeps the finished chunks'
   process.env.ASR_API_KEY = 'local-asr-test-only';
   process.env.ASR_BASE_URL = process.env.DASHSCOPE_BASE_URL;
   process.env.DASHSCOPE_CHAT_MODEL = 'mock-reading';
+  // This test is about stop semantics, not scheduling: pin the pool to one lane
+  // so "chunk 1 finished, chunk 2 in flight" stays deterministic. Parallel
+  // scheduling is covered separately.
+  process.env.ASR_CONCURRENCY = '1';
   process.env.PATH = `${bin}${path.delimiter}${process.env.PATH}`;
   const service = require('../server');
   const { url: base } = await service.startServer(0);
