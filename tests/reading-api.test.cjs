@@ -69,18 +69,20 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       const payload = JSON.parse(body);
-      assert.equal(req.url, '/chat/completions');
+      assert.equal(req.url, payload.model === 'mock-asr' ? '/api/v1/services/aigc/multimodal-generation/generation' : '/chat/completions');
       if (payload.model === 'mock-asr') {
         asrCalls++;
-        assert.equal(payload.messages[0].content[0].type, 'video_url');
-        assert.match(payload.messages[0].content[1].text, /角色名请根据你听到的身份/);
+        assert.equal(payload.input.messages[0].content[0].type, 'input_audio');
+        assert.match(payload.input.messages[0].content[0].input_audio.data, /^data:audio\/mpeg;base64,/);
+        assert.equal(payload.parameters.format, 'mp3');
+        assert.equal(req.headers['authorization'], 'Bearer local-asr-test-only');
         if (asrFailure) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ error: { message: 'mock ASR rejected this chunk' } }));
         }
         const content = '主持人：完整转写。嘉宾：保留原话。';
-        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-        return res.end(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ output: { text: content } }));
       }
       modelCalls++;
       assert.equal(payload.model, 'mock-reading');
@@ -104,7 +106,9 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
   process.env.DASHSCOPE_BASE_URL = `http://127.0.0.1:${model.address().port}`;
   process.env.DASHSCOPE_API_KEY = 'local-test-only';
   process.env.DASHSCOPE_CHAT_MODEL = 'mock-reading';
-  process.env.DASHSCOPE_ASR_MODEL = 'mock-asr';
+  process.env.ASR_MODEL = 'mock-asr';
+  process.env.ASR_API_KEY = 'local-asr-test-only';
+  process.env.ASR_BASE_URL = process.env.DASHSCOPE_BASE_URL;
   process.env.PATH = bin + path.delimiter + process.env.PATH;
   const service = require('../server');
   const { url: base } = await service.startServer(0);
@@ -117,7 +121,7 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
     fs.writeFileSync(path.join(dir, 'transcript.txt'), raw);
     fs.writeFileSync(path.join(dir, 'checkpoint.json'), JSON.stringify({ id, sourceUrl:url, status, totalChunks:1, completedChunks:1 }));
     fs.writeFileSync(path.join(dir, 'metadata.json'), JSON.stringify({ title:'测试标题', uploader:'测试作者', sourceUrl:url }));
-    fs.writeFileSync(path.join(dir, 'normalized.mp4'), 'mock media, validated only by fake ffprobe');
+    fs.writeFileSync(path.join(dir, 'audio.mp3'), 'mock media, validated only by fake ffprobe');
     fs.writeFileSync(path.join(dir, 'results/chunk-000.txt'), raw.split('\n\n')[1]);
     return { id, dir, url };
   }
@@ -277,7 +281,7 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
   });
   await t.test('real pipeline steps emit verified stages and count non-contiguous resumed chunks', async () => {
     const target = seed('https://example.com/measured-pipeline');
-    fs.unlinkSync(path.join(target.dir, 'normalized.mp4'));
+    fs.unlinkSync(path.join(target.dir, 'audio.mp3'));
     fs.renameSync(path.join(target.dir, 'results/chunk-000.txt'), path.join(target.dir, 'results/chunk-002.txt'));
     fs.writeFileSync(path.join(target.dir, 'fake-command.json'), JSON.stringify({ duration: 250, downloadRetry: true }));
     const calls = asrCalls;
@@ -317,7 +321,7 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
       ['splitFail', 'split'], ['splitInvalid', 'split']
     ]) {
       const target = seed('https://example.com/progress-failure-' + option);
-      fs.unlinkSync(path.join(target.dir, 'normalized.mp4'));
+      fs.unlinkSync(path.join(target.dir, 'audio.mp3'));
       fs.writeFileSync(path.join(target.dir, 'fake-command.json'), JSON.stringify({ [option]: true, duration: 250 }));
       const calls = asrCalls;
       const response = await post('/api/transcribe', { url: target.url });
@@ -330,7 +334,7 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
   });
   await t.test('a header-only download stub is retried through every strategy and reported as truncated', async () => {
     const target = seed('https://example.com/progress-failure-truncated');
-    fs.unlinkSync(path.join(target.dir, 'normalized.mp4'));
+    fs.unlinkSync(path.join(target.dir, 'audio.mp3'));
     fs.writeFileSync(path.join(target.dir, 'fake-command.json'), JSON.stringify({ duration: 250, tailPackets: 0 }));
     const response = await post('/api/transcribe', { url: target.url });
     const events = (await response.text()).trim().split('\n').map(JSON.parse);
@@ -342,7 +346,7 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
   });
   await t.test('failed ASR preserves completed chunk counts and never starts reading or reports 100', async () => {
     const target = seed('https://example.com/asr-progress-failure');
-    fs.writeFileSync(path.join(target.dir, 'normalized.mp4'), JSON.stringify({ duration: 250 }));
+    fs.writeFileSync(path.join(target.dir, 'audio.mp3'), JSON.stringify({ duration: 250 }));
     const calls = modelCalls;
     asrFailure = true;
     try {
@@ -360,7 +364,7 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
   await t.test('batch videos each receive a persisted reading version and indexed chunk progress', async () => {
     const targets=batchUrls.map(url=>seed(url));
     for (const target of targets) {
-      fs.writeFileSync(path.join(target.dir, 'normalized.mp4'), JSON.stringify({ duration: 250 }));
+      fs.writeFileSync(path.join(target.dir, 'audio.mp3'), JSON.stringify({ duration: 250 }));
     }
     fs.unlinkSync(path.join(targets[1].dir, 'results/chunk-000.txt'));
     const calls = asrCalls;

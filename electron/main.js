@@ -41,7 +41,9 @@ function ensureConfigFiles(userDataDir) {
       : [
           "DASHSCOPE_API_KEY=",
           "DASHSCOPE_BASE_URL=https://coding.dashscope.aliyuncs.com/v1",
-          "DASHSCOPE_ASR_MODEL=qwen3.7-plus",
+          "ASR_API_KEY=",
+          "ASR_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1",
+          "ASR_MODEL=qwen-audio-3.1-asr-flash",
           "DASHSCOPE_CHAT_MODEL=qwen3.7-plus",
           "YTDLP_EXTRA_ARGS="
         ].join("\n");

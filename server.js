@@ -31,7 +31,9 @@ let shuttingDown = false;
 
 loadEnvFile(path.join(APP_DATA_DIR, ".env"), { override: APP_DATA_DIR !== ROOT_DIR });
 
-const ASR_MODEL_NAME = process.env.DASHSCOPE_ASR_MODEL || "qwen3.7-plus";
+const ASR_MODEL_NAME = process.env.ASR_MODEL || "qwen-audio-3.1-asr-flash";
+const ASR_API_KEY = String(process.env.ASR_API_KEY || "").trim();
+const ASR_BASE_URL = String(process.env.ASR_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/+$/, "");
 const CHAT_MODEL_NAME = process.env.DASHSCOPE_CHAT_MODEL || "qwen3.7-plus";
 const API_BASE_URL = String(
   process.env.DASHSCOPE_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -466,14 +468,14 @@ async function handleTranscribe(req, res) {
   try {
     const body = await readJson(req);
     const videoUrl = String(body.url || "").trim();
-    const apiKey = String(process.env.DASHSCOPE_API_KEY || "").trim();
+    const apiKey = ASR_API_KEY;
 
     if (!videoUrl) {
       return sendJson(res, 400, { error: "Please provide a video URL." });
     }
 
     if (!isConfiguredApiKey(apiKey)) {
-      return sendJson(res, 500, { error: "Missing DASHSCOPE_API_KEY in .env." });
+      return sendJson(res, 500, { error: "请在本机 .env 中配置 ASR_API_KEY（百炼通用 Key）和 ASR_BASE_URL。" });
     }
 
     assertRequiredCommands(["yt-dlp", "ffmpeg", "ffprobe"]);
@@ -491,6 +493,7 @@ async function handleTranscribe(req, res) {
     fs.mkdirSync(job.dir, { recursive: true });
     fs.mkdirSync(job.chunksDir, { recursive: true });
     fs.mkdirSync(job.resultsDir, { recursive: true });
+    archivePreviousAsrResults(job);
 
     res.writeHead(200, {
       "Content-Type": "application/x-ndjson; charset=utf-8",
@@ -537,11 +540,11 @@ async function handleTranscribe(req, res) {
     // Every stage of this run (child processes, model calls, retry backoff) hangs
     // off this signal, so /api/stop can interrupt work that is already in flight.
     beginJobRun(job);
-    const info = await downloadVideo(videoUrl, job, sendEvent);
+    const info = await prepareAudio(videoUrl, job, sendEvent);
     sendEvent({
       type: "status",
       step: "downloaded",
-      message: `已下载视频：${info.title}`
+      message: `音频已就绪：${info.title}`
     });
 
     const metadata = {
@@ -560,14 +563,14 @@ async function handleTranscribe(req, res) {
       ...metadata,
       status: "downloaded",
       sourcePath: info.sourcePath || "",
-      videoPath: info.videoPath
+      audioPath: info.audioPath
     });
 
-    const chunks = await splitVideo(info.videoPath, job, sendEvent);
+    const chunks = await splitAudio(info.audioPath, job, sendEvent);
     sendEvent({
       type: "status",
       step: "chunks_ready",
-      message: `视频已切成 ${chunks.length} 段。`
+      message: `音频已切成 ${chunks.length} 段。`
     });
     updateCheckpoint(job, {
       id: job.id,
@@ -610,7 +613,7 @@ async function handleTranscribe(req, res) {
         sendEvent({
           type: "status",
           step: "resume",
-          message: `跳过已完成视频段 ${index + 1}/${chunks.length}。`,
+          message: `跳过已完成音频段 ${index + 1}/${chunks.length}。`,
           progress: Math.round(((index + 1) / chunks.length) * 100)
         });
         sendTranscribeProgress(job, chunks.length, sendEvent);
@@ -620,7 +623,7 @@ async function handleTranscribe(req, res) {
       sendEvent({
         type: "status",
         step: "transcribing",
-        message: `正在识别视频段 ${index + 1}/${chunks.length}...`,
+        message: `正在识别音频段 ${index + 1}/${chunks.length}...`,
         progress: Math.round((index / chunks.length) * 100)
       });
       updateCheckpoint(job, {
@@ -671,7 +674,7 @@ async function handleTranscribe(req, res) {
       sendEvent({
         type: "status",
         step: "saved",
-        message: `已保存视频段 ${index + 1}/${chunks.length} 到 transcript.txt。`,
+        message: `已保存音频段 ${index + 1}/${chunks.length} 到 transcript.txt。`,
         progress: Math.round(((index + 1) / chunks.length) * 100)
       });
       sendTranscribeProgress(job, chunks.length, sendEvent);
@@ -770,14 +773,14 @@ async function handleBatchTranscribe(req, res) {
   try {
     const body = await readJson(req);
     const playlistUrl = String(body.url || "").trim();
-    const apiKey = String(process.env.DASHSCOPE_API_KEY || "").trim();
+    const apiKey = ASR_API_KEY;
 
     if (!playlistUrl) {
       return sendJson(res, 400, { error: "Please provide a playlist URL." });
     }
 
     if (!isConfiguredApiKey(apiKey)) {
-      return sendJson(res, 500, { error: "Missing DASHSCOPE_API_KEY in .env." });
+      return sendJson(res, 500, { error: "请在本机 .env 中配置 ASR_API_KEY（百炼通用 Key）和 ASR_BASE_URL。" });
     }
 
     assertRequiredCommands(["yt-dlp", "ffmpeg", "ffprobe"]);
@@ -862,6 +865,7 @@ async function handleBatchTranscribe(req, res) {
         fs.mkdirSync(job.dir, { recursive: true });
         fs.mkdirSync(job.chunksDir, { recursive: true });
         fs.mkdirSync(job.resultsDir, { recursive: true });
+        archivePreviousAsrResults(job);
 
         const wrappedSend = (payload) => {
           sendEvent({
@@ -882,7 +886,7 @@ async function handleBatchTranscribe(req, res) {
         }
 
         beginJobRun(job);
-        const info = await downloadVideo(entry.url, job, wrappedSend);
+        const info = await prepareAudio(entry.url, job, wrappedSend);
         wrappedSend({ type: "status", step: "downloaded", message: `已下载：${info.title}` });
 
         const metadata = {
@@ -893,7 +897,7 @@ async function handleBatchTranscribe(req, res) {
         };
         writeJsonFile(job.metadataPath, metadata);
 
-        const chunks = await splitVideo(info.videoPath, job, wrappedSend);
+        const chunks = await splitAudio(info.audioPath, job, wrappedSend);
         wrappedSend({ type: "status", step: "chunks_ready", message: `已切成 ${chunks.length} 段` });
 
         for (let index = 0; index < chunks.length; index++) {
@@ -1309,8 +1313,11 @@ function handleDownload(url, res) {
 
 async function prepareAudio(videoUrl, job, sendEvent) {
   let existingSourcePath = findFirstFile(job.dir, /^source\.(m4a|mp3|webm|mp4|mkv|mov|m4v|wav|aac|opus)$/i);
+  sendStageProgress(job, sendEvent, "download", { percent: null });
 
   if (fs.existsSync(job.audioPath) && await isValidMediaFile(job.audioPath, { requireCompleteContent: true })) {
+    sendStageProgress(job, sendEvent, "download", { percent: 100 });
+    sendStageProgress(job, sendEvent, "normalize", { percent: 100 });
     sendEvent({
       type: "status",
       step: "resume",
@@ -1343,6 +1350,10 @@ async function prepareAudio(videoUrl, job, sendEvent) {
   }
 
   let sourcePath = existingSourcePath;
+  if (!sourcePath && fs.existsSync(job.normalizedPath) &&
+      await isValidMediaFile(job.normalizedPath, { requireCompleteContent: true })) {
+    sourcePath = job.normalizedPath;
+  }
   const outputTemplate = path.join(job.dir, "source.%(ext)s");
 
   if (!sourcePath) {
@@ -1365,6 +1376,11 @@ async function prepareAudio(videoUrl, job, sendEvent) {
     throw new Error("Could not find downloaded audio file.");
   }
 
+  sendStageProgress(job, sendEvent, "download", { percent: 100 });
+  const durationSeconds = await getMediaDuration(sourcePath);
+  sendStageProgress(job, sendEvent, "normalize", { percent: durationSeconds > 0 ? 0 : null });
+  const normalizationProgress = createFfmpegProgress(durationSeconds,
+    progress => sendStageProgress(job, sendEvent, "normalize", progress));
   sendEvent({
     type: "status",
     step: "normalize",
@@ -1389,7 +1405,8 @@ async function prepareAudio(videoUrl, job, sendEvent) {
     normalizedTmpPath
   ], {
     cwd: job.dir,
-    signal: job.run?.signal
+    signal: job.run?.signal,
+    ...normalizationProgress
   });
 
   if (!await isValidMediaFile(normalizedTmpPath, { requireCompleteContent: true })) {
@@ -1398,6 +1415,7 @@ async function prepareAudio(videoUrl, job, sendEvent) {
   }
 
   fs.renameSync(normalizedTmpPath, job.audioPath);
+  sendStageProgress(job, sendEvent, "normalize", { percent: 100 });
   const videoInfo = await getJobVideoInfo(videoUrl, job);
   return {
     title: videoInfo.title,
@@ -1408,6 +1426,7 @@ async function prepareAudio(videoUrl, job, sendEvent) {
 }
 
 async function splitAudio(audioPath, job, sendEvent) {
+  sendStageProgress(job, sendEvent, "split", { percent: null });
   const durationSeconds = await getMediaDuration(audioPath);
   if (durationSeconds <= MAX_CHUNK_SECONDS) {
     writeChunksManifest(job, {
@@ -1418,11 +1437,13 @@ async function splitAudio(audioPath, job, sendEvent) {
       chunks: [path.basename(audioPath)],
       singleFile: true
     });
+    sendStageProgress(job, sendEvent, "split", { percent: 100 });
     return [audioPath];
   }
 
   const reusableChunks = await getReusableChunks(job, durationSeconds);
   if (reusableChunks.length > 0) {
+    sendStageProgress(job, sendEvent, "split", { percent: 100 });
     sendEvent({
       type: "status",
       step: "resume",
@@ -1457,6 +1478,9 @@ async function splitAudio(audioPath, job, sendEvent) {
 
   try {
     const chunkPattern = path.join(tempChunksDir, "chunk-%03d.mp3");
+    sendStageProgress(job, sendEvent, "split", { percent: 0 });
+    const splittingProgress = createFfmpegProgress(durationSeconds,
+      progress => sendStageProgress(job, sendEvent, "split", progress));
     await runCommand("ffmpeg", [
       "-y",
       "-i",
@@ -1479,7 +1503,8 @@ async function splitAudio(audioPath, job, sendEvent) {
       chunkPattern
     ], {
       cwd: job.dir,
-      signal: job.run?.signal
+      signal: job.run?.signal,
+      ...splittingProgress
     });
 
     const chunkFiles = listChunkFiles(tempChunksDir);
@@ -1510,6 +1535,7 @@ async function splitAudio(audioPath, job, sendEvent) {
       singleFile: false
     });
 
+    sendStageProgress(job, sendEvent, "split", { percent: 100 });
     return finalChunks;
   } finally {
     fs.rmSync(tempChunksDir, { recursive: true, force: true });
@@ -2100,7 +2126,7 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
   ];
 
   if (options.audioOnly) {
-    baseArgs.unshift("-f", "ba[protocol=https]/ba/bestaudio", "-S", "abr:64");
+    baseArgs.unshift("-f", "ba[protocol=https]/ba/b[protocol=https]/b", "-S", "res:144,abr:64");
   } else {
     // Transcription normalizes to 640px wide. Avoid downloading 4K/8K just
     // to discard almost every pixel; prefer a capped stream on any protocol
@@ -2156,7 +2182,7 @@ function buildYtDlpStrategies(videoUrl, outputTemplate, options = {}) {
       args: options.audioOnly
         ? [
           "--extractor-args", "youtube:player_client=default",
-          "-f", "ba[protocol=https][ext=m4a]/ba"
+          "-f", "ba[protocol=https][ext=m4a]/ba/b[protocol=https]/b"
         ]
         : [
           "--extractor-args", "youtube:player_client=default",
@@ -2245,57 +2271,45 @@ function formatYtDlpError(error, videoUrl) {
 }
 
 async function transcribeChunk({ apiKey, chunkPath, signal }) {
-  const videoBase64 = fs.readFileSync(chunkPath).toString("base64");
-  const body = {
-    model: ASR_MODEL_NAME,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "video_url",
-            video_url: {
-              url: `data:video/mp4;base64,${videoBase64}`
-            }
-          },
-          {
-            type: "text",
-            text: [
-              "请把这段视频中的中文、英文或其他语言口播尽可能完整地转写成连续文字。",
-              "不要总结，不要补充解释，不要输出无关内容。",
-              "如果有明显听不清的片段，用[不清晰]标记。",
-              "如果这段视频里有多个人在讲话，请按说话人分行标注，每行格式为“- 角色名：说话内容”。",
-              "角色名请根据你听到的身份来命名，例如主持人、嘉宾、旁白、提问者，同一个人在这段里始终用同一个名字。",
-              "不要使用“说话人1”“说话人2”这类编号，因为不同片段的编号互不对应。",
-              "如果全程只有一个人讲话，不要添加任何角色前缀，直接输出连续文字。",
-              "标注只用于区分说话人，不得因此删减、改写或概括口播内容。"
-            ].join("")
-          }
-        ]
-      }
-    ],
-    stream: true
-  };
+  return transcribeAudioChunk({ apiKey, chunkPath, signal });
+}
 
-  let text;
-  try {
-    text = await callDashScopeChat(apiKey, body, { signal });
-  } catch (error) {
-    // Whatever the HTTP client called it (AbortError, reset socket, half an SSE
-    // stream), an aborted run is a stop and must not look like a provider fault.
-    if (signal?.aborted) {
-      const reason = signal.reason;
-      throw error instanceof JobStoppedError ? error
-        : reason instanceof Error ? reason
-        : new JobStoppedError();
-    }
-    throw error;
+function buildAsrEndpoint(baseUrl) {
+  const endpoint = new URL(baseUrl);
+  if (endpoint.protocol !== "https:" && endpoint.hostname !== "127.0.0.1" && endpoint.hostname !== "localhost") {
+    throw new Error("ASR_BASE_URL 必须使用 HTTPS。");
   }
+  endpoint.pathname = "/api/v1/services/aigc/multimodal-generation/generation";
+  endpoint.search = "";
+  endpoint.hash = "";
+  return endpoint.href;
+}
 
-  if (!text) {
-    throw new Error("DashScope returned no transcript text.");
+async function transcribeAudioChunk({ apiKey, chunkPath, signal }) {
+  const audioBase64 = fs.readFileSync(chunkPath).toString("base64");
+  const response = await fetch(buildAsrEndpoint(ASR_BASE_URL), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "X-DashScope-SSE": "disable"
+    },
+    body: JSON.stringify({
+      model: ASR_MODEL_NAME,
+      input: { messages: [{ role: "user", content: [{
+        type: "input_audio", input_audio: { data: `data:audio/mpeg;base64,${audioBase64}` }
+      }] }] },
+      parameters: { format: "mp3", sample_rate: 16000 }
+    }),
+    signal
+  });
+  const data = await response.json();
+  if (!response.ok || data.code) {
+    const detail = data.message || data.error?.message || response.statusText || data.code;
+    throw new Error(`ASR request failed (${response.status}): ${detail}`);
   }
-
+  const text = extractTextFromDashScope(data);
+  if (!text) throw new Error("ASR returned no transcript text.");
   return text;
 }
 
@@ -2512,7 +2526,7 @@ function buildJobStatus(job) {
     nextResumeChunkHuman: nextResumeChunk != null ? nextResumeChunk + 1 : null,
     progress: totalChunks ? Math.round((completedChunks / totalChunks) * 100) : 0,
     videoPath: videoExists ? job.normalizedPath : "",
-    audioPath: videoExists ? job.normalizedPath : "",
+    audioPath: fs.existsSync(job.audioPath) ? job.audioPath : "",
     chunksDir: fs.existsSync(job.chunksDir) ? job.chunksDir : "",
     resultsDir: fs.existsSync(job.resultsDir) ? job.resultsDir : "",
     transcriptPath: fs.existsSync(job.transcriptPath) ? job.transcriptPath : "",
@@ -2565,6 +2579,11 @@ function buildPublicConfig() {
       baseUrl: API_BASE_URL,
       asrModel: ASR_MODEL_NAME,
       chatModel: CHAT_MODEL_NAME
+    },
+    asr: {
+      apiKeyConfigured: isConfiguredApiKey(ASR_API_KEY),
+      baseUrl: ASR_BASE_URL,
+      model: ASR_MODEL_NAME
     },
     ytdlpExtraArgsConfigured: YTDLP_EXTRA_ARGS.length > 0
   };
@@ -2651,6 +2670,28 @@ function createJob(videoUrl) {
     readingMarkdownPath: path.join(dir, "reading.md"),
     readingStatePath: path.join(dir, "reading-state.json")
   };
+}
+
+function archivePreviousAsrResults(job) {
+  const checkpoint = readJsonFile(job.checkpointPath);
+  const metadata = readJsonFile(job.metadataPath);
+  const previousModel = checkpoint.asrModel || metadata.asrModel;
+  const manifest = readJsonFile(job.chunksManifestPath);
+  if ((!previousModel || previousModel === ASR_MODEL_NAME) && manifest.kind !== "video") return;
+  const derivedPaths = [job.chunksDir, job.resultsDir, job.chunksManifestPath,
+    job.transcriptPath, job.readingPath, job.readingMarkdownPath, job.readingStatePath];
+  if (!derivedPaths.some(filePath => fs.existsSync(filePath) &&
+      (!fs.statSync(filePath).isDirectory() || fs.readdirSync(filePath).length))) return;
+  const archiveDir = path.join(job.dir, `previous-transcription-${Date.now()}`);
+  fs.mkdirSync(archiveDir, { recursive: true });
+  for (const filePath of [job.metadataPath, job.checkpointPath]) {
+    if (fs.existsSync(filePath)) fs.copyFileSync(filePath, path.join(archiveDir, path.basename(filePath)));
+  }
+  for (const filePath of derivedPaths) {
+    if (fs.existsSync(filePath)) fs.renameSync(filePath, path.join(archiveDir, path.basename(filePath)));
+  }
+  fs.mkdirSync(job.chunksDir, { recursive: true });
+  fs.mkdirSync(job.resultsDir, { recursive: true });
 }
 
 function getJobById(jobId) {

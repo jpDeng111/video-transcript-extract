@@ -76,6 +76,9 @@ else { process.stderr.write('Unexpected media download in cached-only test'); pr
   process.env.DASHSCOPE_BASE_URL = `http://127.0.0.1:${model.address().port}`;
   process.env.DASHSCOPE_API_KEY = 'local-test-only';
   process.env.DASHSCOPE_CHAT_MODEL = 'mock-progress';
+  process.env.ASR_API_KEY = 'local-asr-test-only';
+  process.env.ASR_BASE_URL = process.env.DASHSCOPE_BASE_URL;
+  process.env.ASR_MODEL = 'qwen-audio-3.1-asr-flash';
   process.env.PATH = bin + path.delimiter + process.env.PATH;
   const url = 'https://example.com/real-progress-contract';
   const jobId = crypto.createHash('sha256').update(url).digest('hex').slice(0, 16);
@@ -85,7 +88,7 @@ else { process.stderr.write('Unexpected media download in cached-only test'); pr
   const raw = `## Chunk 1\n\n${body}\n`;
   fs.writeFileSync(path.join(jobDir, 'transcript.txt'), raw);
   fs.writeFileSync(path.join(jobDir, 'results/chunk-000.txt'), body + '\n');
-  fs.writeFileSync(path.join(jobDir, 'normalized.mp4'), 'fake media validated by local fake ffprobe');
+  fs.writeFileSync(path.join(jobDir, 'audio.mp3'), 'fake media validated by local fake ffprobe');
   fs.writeFileSync(path.join(jobDir, 'metadata.json'), JSON.stringify({ title: '本地进度测试', uploader: '测试作者', sourceUrl: url }));
   fs.writeFileSync(path.join(jobDir, 'checkpoint.json'), JSON.stringify({ id: jobId, sourceUrl: url, status: 'complete', completedChunks: 1, totalChunks: 1 }));
   const originalFetch = global.fetch;

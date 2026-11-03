@@ -1,13 +1,13 @@
 # 视频转写问答 Web 应用
 
-本项目是一个仅供本机使用的 Web 小工具：输入视频链接（B 站、YouTube、抖音等），自动下载并压缩视频，调用阿里云百炼 Coding Plan 的 `qwen3.7-plus` 多模态模型将视频内容转成文字，并支持基于生成文稿继续提问。
+本项目是一个仅供本机使用的 Web 小工具：输入视频链接（B 站、YouTube、抖音等），优先下载音频，调用阿里云百炼 `qwen-audio-3.1-asr-flash` 将口播转成文字，并支持基于生成文稿继续提问。
 
 ## 功能特性
 
 - **多平台支持**：自动识别 B 站、YouTube、抖音、小红书、Twitter 等平台，按平台适配下载参数
-- **按转写需求下载**：优先下载不超过 480p 的视频和约 64kbps 音频，原生 DASH/HLS 分片默认 4 路并发，减少下载体积和等待时间
+- **按转写需求下载**：优先下载约 64kbps 的独立音轨，原生 DASH/HLS 分片默认 4 路并发，减少下载体积和等待时间
 - **合集批量转写**：粘贴合集/播放列表链接自动识别，逐个视频批量转写并实时显示每个视频进度
-- **视频直传模型**：将视频以 `video_url` 格式直接输入 `qwen3.7-plus`，同时利用画面和音频信息
+- **音频优先识别**：只下载独立音轨，按 120 秒切段发送到 `qwen-audio-3.1-asr-flash`；无独立音轨时回退到含声音的视频。不把画面字幕当作口播，不包含视觉内容识别
 - **断点续传**：中断后重新提交同一链接，自动从断点继续
 - **文稿下载**：转写完成后可一键下载 txt 文件，文件名格式为 `标题-博主名-平台.txt`
 - **文稿问答**：基于生成的文稿内容向模型提问
@@ -18,7 +18,7 @@
 - 后端：原生 Node.js `http` 服务（零 npm 依赖）
 - 视频下载：`yt-dlp`
 - 视频处理：`ffmpeg` / `ffprobe`
-- 视频转写：阿里云百炼 Coding Plan `qwen3.7-plus`
+- 语音转写：阿里云百炼通用 API `qwen-audio-3.1-asr-flash`（原生 HTTP 接口，独立配置 Key 与地址）
 - 文稿问答：阿里云百炼 Coding Plan `qwen3.7-plus`
 
 ## 本地启动
@@ -34,7 +34,9 @@ cp .env.example .env
 ```env
 DASHSCOPE_API_KEY=你的百炼 API Key
 DASHSCOPE_BASE_URL=https://coding.dashscope.aliyuncs.com/v1
-DASHSCOPE_ASR_MODEL=qwen3.7-plus
+ASR_API_KEY=你的百炼通用APIKey
+ASR_BASE_URL=https://你的工作空间ID.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+ASR_MODEL=qwen-audio-3.1-asr-flash
 DASHSCOPE_CHAT_MODEL=qwen3.7-plus
 PORT=3002
 # 可选：全局 yt-dlp 额外参数（如代理），各平台参数已自动适配
@@ -90,31 +92,31 @@ npm start
 - `POST /api/playlist-check`：探测链接是否为合集，返回 `{ isPlaylist, count, entries }`
 - `POST /api/transcribe-batch`：批量转写合集，NDJSON 流式推送每个视频的进度事件
 
-## 视频分段策略
+## 音频识别与分段策略
 
-后端会先把视频压缩为 640px、CRF 36、音频 32kbps 单声道，再按 120 秒切段。每段视频以 base64 编码通过 `video_url` 格式发给 `qwen3.7-plus`。
+ASR 使用独立的 `ASR_API_KEY`、`ASR_BASE_URL` 和 `ASR_MODEL`，默认最新的短音频模型 `qwen-audio-3.1-asr-flash`（2026-11-03 核对）。请从百炼控制台复制同一地域、同一业务空间的通用 Key 和 Base URL，不能混用 Coding Plan Key。ASR 调用独立按量计费。
 
-| 参数 | 值 | 说明 |
-|---|---|---|
-| 分辨率 | 640px 宽 | 在保证可识别的前提下尽量缩小 |
-| CRF | 36 | 较高压缩比 |
-| 码率上限 | 800k | 防止突发高码率 |
-| 音频 | 32kbps / 16kHz / 单声道 | 语音识别足够 |
-| 分段 | 120 秒 | 保证 base64 后不超过 API 28MB 限制 |
+该模型使用百炼原生接口，应用自动将配置的 OpenAI 兼容地址转换为同一域名下的 `/api/v1/services/aigc/multimodal-generation/generation`，不会向问答模型的地址发送语音识别请求。音频以 `input_audio` Base64 Data URI 发送，读取 `output.text`，不需要 OSS。默认不启用转写润色，以保留口播；分段结果不会保证跨段说话人身份一致。
+
+流程：下载独立音轨 → 转为 MP3（16kHz / 单声道 / 32kbps）→ 每 120 秒切段 → ASR → 保存逐字稿 → 主题整理与问答。分段完成数、停止、重试和断点保存均适用于音频流程。已有完整源视频或规范化视频会直接提取音频，避免重复下载。
+
+旧视觉模型不支持理解视频音轨，因此从旧模型切换时，已有分段和文稿会移到任务目录的 `previous-transcription-<时间戳>/` 中备份，再以真实音频重做识别；源视频保留。同一 ASR 模型的任务仍可从已完成分段继续。
+
+官方文档：[模型说明](https://help.aliyun.cn/zh/model-studio/qwen-audio-3-1-asr-flash)、[原生 HTTP API](https://help.aliyun.com/en/model-studio/qwen-audio-asr-http-api)。
 
 ## 断点续传
 
-- 每个视频链接对应一个 `jobs/<hash>/` 目录，保存 `source.mp4`、`normalized.mp4`、`transcript.txt`、`checkpoint.json` 等。
+- 每个视频链接对应一个 `jobs/<hash>/` 目录，保存 `source.*`、`audio.mp3`、`transcript.txt`、`checkpoint.json` 等。
 - 每个视频 chunk 完成后立即写入 `results/chunk-xxx.txt`，再重建 `transcript.txt`。
 - 中途失败后，重新提交同一链接会跳过已完成 chunk，从断点继续。
 - `checkpoint.json` 记录当前阶段、总段数、已完成段数、当前 chunk 和最近错误。
-- 每个视频片段最多自动重试 3 次。
+- 每个音频片段最多尝试 3 次。
 
 ## 多平台与下载排查
 
 ### 下载速度优化
 
-旧版默认选择最高画质，再压缩到 640px 宽，长视频可能先下载数 GB 的 4K 视频。现在所有下载策略优先选择不超过 480p 的视频，音频优先约 64kbps；没有合适的低分辨率流时，选择可用的最接近画质。画面仍会参与转写。
+旧版默认选择最高画质，再压缩到 640px 宽，长视频可能先下载数 GB 的 4K 视频。现在主流程只下载音轨，音频优先约 64kbps。平台没有独立音轨时，选择低分辨率的音画合一流后提取声音。视频下载工具仍保留 480p 优先策略供后续画面扩展使用，当前 ASR 不使用画面。
 
 原生 DASH/HLS 分片默认 4 路并发；普通 HTTPS 整文件下载不受此并发参数影响。分片耗尽重试后会报错，避免跳过分片造成文稿缺失。网络下载和分片各重试 3 次、提取重试 2 次，单次连接超时 15 秒；YouTube 下载残缺时直接切换到无 Cookies 的 DASH 提取方式，避免重复下载同一残缺流。标题和作者会随下载保存，后续处理优先复用，减少重复提取请求。
 

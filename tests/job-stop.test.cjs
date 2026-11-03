@@ -158,17 +158,22 @@ test('stop mid-request ends the stream as stopped and keeps the finished chunks'
       }
       if (asrCalls >= 2 && hold) await hold;
       const content = `转写片段 ${asrCalls}。`;
-      reply(res, `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`);
+      if (!res.destroyed && !res.writableEnded) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ output: { text: content } }));
+      }
     });
   });
   await new Promise((resolve) => model.listen(0, '127.0.0.1', resolve));
 
-  const previousEnv = ['APP_DATA_DIR', 'DASHSCOPE_BASE_URL', 'DASHSCOPE_API_KEY', 'DASHSCOPE_ASR_MODEL', 'DASHSCOPE_CHAT_MODEL', 'PATH']
+  const previousEnv = ['APP_DATA_DIR', 'DASHSCOPE_BASE_URL', 'DASHSCOPE_API_KEY', 'ASR_MODEL', 'ASR_API_KEY', 'ASR_BASE_URL', 'DASHSCOPE_CHAT_MODEL', 'PATH']
     .map((key) => [key, process.env[key]]);
   process.env.APP_DATA_DIR = root;
   process.env.DASHSCOPE_BASE_URL = `http://127.0.0.1:${model.address().port}`;
   process.env.DASHSCOPE_API_KEY = 'local-test-only';
-  process.env.DASHSCOPE_ASR_MODEL = 'mock-asr';
+  process.env.ASR_MODEL = 'mock-asr';
+  process.env.ASR_API_KEY = 'local-asr-test-only';
+  process.env.ASR_BASE_URL = process.env.DASHSCOPE_BASE_URL;
   process.env.DASHSCOPE_CHAT_MODEL = 'mock-reading';
   process.env.PATH = `${bin}${path.delimiter}${process.env.PATH}`;
   const service = require('../server');
@@ -189,7 +194,7 @@ test('stop mid-request ends the stream as stopped and keeps the finished chunks'
   const dir = path.join(root, 'jobs', jobId);
   fs.mkdirSync(path.join(dir, 'results'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'metadata.json'), JSON.stringify({ title: '测试标题', uploader: '测试作者', sourceUrl: videoUrl }));
-  fs.writeFileSync(path.join(dir, 'normalized.mp4'), JSON.stringify({ duration: 250 }));
+  fs.writeFileSync(path.join(dir, 'audio.mp3'), JSON.stringify({ duration: 250 }));
 
   const post = (endpoint, body) => fetch(base + endpoint, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
