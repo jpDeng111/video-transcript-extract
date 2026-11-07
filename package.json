@@ -1,6 +1,6 @@
 {
   "name": "video-script-extract",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local web app to extract transcripts from video URLs",
   "main": "electron/main.js",
   "scripts": {

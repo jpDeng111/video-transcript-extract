@@ -2,6 +2,9 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { Readable, Writable } = require("node:stream");
+const { finished } = require("node:stream/promises");
+const { TaskQueue } = require("./lib/task-queue");
 const { spawn } = require("child_process");
 const { createReadingDocument, getTranscriptHash, toReadingMarkdown } = require("./lib/transcript-reading");
 const { createYtDlpProgress, createFfmpegProgress, countProgress } = require("./lib/process-progress");
@@ -54,6 +57,11 @@ const YTDLP_MAX_HEIGHT = boundedDownloadSetting(process.env.YTDLP_MAX_HEIGHT, 48
 const YTDLP_CONCURRENT_FRAGMENTS = boundedDownloadSetting(process.env.YTDLP_CONCURRENT_FRAGMENTS, 4, 1, 16);
 fs.mkdirSync(JOBS_ROOT, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
+const taskQueue = new TaskQueue({
+  filePath: path.join(DATA_DIR, "task-queue.json"),
+  resolveTitle: async (url, signal) => (await fetchVideoInfo(url, signal)).title,
+  run: runQueuedTranscription
+});
 const PORT = Number(process.env.PORT || 3000);
 
 function detectPlatform(videoUrl) {
@@ -121,6 +129,22 @@ const server = http.createServer(async (req, res) => {
       return await handleTranscribe(req, res);
     }
 
+    if (url.pathname === "/api/queue" && req.method === "GET") {
+      return sendJson(res, 200, { tasks: taskQueue.list() });
+    }
+    if (url.pathname === "/api/queue" && req.method === "POST") {
+      return await handleEnqueue(req, res);
+    }
+    const queueAction = /^\/api\/queue\/([\w-]+)\/(cancel|retry)$/.exec(url.pathname);
+    if (req.method === "POST" && queueAction) {
+      try {
+        const task = queueAction[2] === "cancel" ? taskQueue.cancel(queueAction[1]) : taskQueue.retry(queueAction[1]);
+        return sendJson(res, 200, { task });
+      } catch (error) {
+        return sendJson(res, 400, { error: getErrorMessage(error) });
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/api/transcribe-batch") {
       return await handleBatchTranscribe(req, res);
     }
@@ -182,6 +206,7 @@ function startServer(port = PORT, host = process.env.HOST || "127.0.0.1") {
     const onListening = () => {
       server.off("error", onError);
       activeServer = server;
+      taskQueue.start();
       const info = buildServerInfo(server, host);
       console.log(`Server running at ${info.url}`);
       resolve(info);
@@ -194,6 +219,7 @@ function startServer(port = PORT, host = process.env.HOST || "127.0.0.1") {
 }
 
 function stopServer() {
+  taskQueue.close();
   shuttingDown = true;
   for (const run of activeReadingRuns.values()) {
     run.controller.abort(new Error("应用退出，主题整理已中断；重新打开后可重试。"));
@@ -554,7 +580,7 @@ async function handleTranscribe(req, res) {
 
     // Every stage of this run (child processes, model calls, retry backoff) hangs
     // off this signal, so /api/stop can interrupt work that is already in flight.
-    beginJobRun(job);
+    beginJobRun(job, req.queueSignal);
     const info = await prepareAudio(videoUrl, job, sendEvent);
     sendEvent({
       type: "status",
@@ -797,6 +823,76 @@ async function handleTranscribe(req, res) {
     if (acquiredRun && job) {
       activeJobRuns.delete(job.id);
     }
+  }
+}
+
+async function handleEnqueue(req, res) {
+  try {
+    const body = await readJson(req);
+    const videoUrl = String(body.url || "").trim();
+    const parsed = new URL(videoUrl);
+    if (!["https:", "http:"].includes(parsed.protocol)) throw new Error("请输入有效的视频链接。");
+    if (!isConfiguredApiKey(ASR_API_KEY)) throw new Error("请先配置 ASR_API_KEY 和 ASR_BASE_URL。");
+    assertRequiredCommands(["yt-dlp", "ffmpeg", "ffprobe"]);
+    const existing = taskQueue.list().find(task => task.url === videoUrl &&
+      ["queued", "resolving", "running"].includes(task.state));
+    if (existing) return sendJson(res, 200, { tasks: [existing], duplicates: 1 });
+    const entries = await fetchPlaylistEntries(videoUrl);
+    const added = [];
+    let duplicates = 0;
+    for (const entry of entries || [{ url: videoUrl }]) {
+      const job = createJob(entry.url);
+      let title = entry.title;
+      if (!title) {
+        const info = await getJobVideoInfo(entry.url, job);
+        title = info.title === "Untitled Video" ? "" : info.title;
+        if (title) {
+          fs.mkdirSync(job.dir, { recursive: true });
+          writeJsonFile(job.metadataPath, { ...readJsonFile(job.metadataPath), ...info, sourceUrl: entry.url });
+        }
+      }
+      const result = taskQueue.add({ url: entry.url, title, jobId: job.id });
+      added.push(result.task);
+      if (result.duplicate) duplicates++;
+    }
+    return sendJson(res, 200, { tasks: added, duplicates });
+  } catch (error) {
+    return sendJson(res, 400, { error: getErrorMessage(error) });
+  }
+}
+
+async function runQueuedTranscription(task, onEvent, signal) {
+  signal.throwIfAborted();
+  const request = Readable.from([Buffer.from(JSON.stringify({ url: task.url }))]);
+  request.queueSignal = signal;
+  let buffer = "";
+  let outcome = null;
+  const response = new Writable({
+    write(chunk, encoding, callback) {
+      try {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+          if (event.type === "done" || event.type === "error" || event.type === "stopped") outcome = event;
+          onEvent(event);
+        }
+        callback();
+      } catch (error) { callback(error); }
+    }
+  });
+  response.headersSent = false;
+  response.writeHead = () => { response.headersSent = true; return response; };
+  response.setHeader = () => {};
+  await handleTranscribe(request, response);
+  await finished(response);
+  signal.throwIfAborted();
+  if (!outcome || outcome.type !== "done") {
+    const detail = outcome?.error || outcome?.message ||
+      (buffer ? JSON.parse(buffer).error : "任务连接结束，但未完成转写。");
+    throw new Error(detail);
   }
 }
 
@@ -1663,7 +1759,7 @@ class JobStoppedError extends Error {
 
 // One control per running job: the stop signal every child process and model
 // request hangs off, plus the timings the remaining-time estimate needs.
-function beginJobRun(job) {
+function beginJobRun(job, externalSignal) {
   const controller = new AbortController();
   const run = {
     jobId: job.id,
@@ -1678,12 +1774,20 @@ function beginJobRun(job) {
   };
   job.run = run;
   activeJobControls.set(job.id, run);
+  if (externalSignal) {
+    const abort = () => stopJobRun(job.id, externalSignal.reason?.message || "已停止队列任务。");
+    run.externalSignal = externalSignal;
+    run.externalAbort = abort;
+    if (externalSignal.aborted) abort();
+    else externalSignal.addEventListener("abort", abort, { once: true });
+  }
   return run;
 }
 
 function endJobRun(job) {
   const run = job?.run;
   if (!run) return;
+  run.externalSignal?.removeEventListener("abort", run.externalAbort);
   if (activeJobControls.get(run.jobId) === run) activeJobControls.delete(run.jobId);
   job.run = null;
 }
@@ -3123,7 +3227,7 @@ async function getMediaDuration(mediaPath) {
 
 function assertRequiredCommands(commands) {
   for (const command of commands) {
-    if (!findBinary(command)) {
+    if (!findBinary(command, process.env)) {
       throw new Error(
         `Missing required command: ${command}. ` +
         (IS_SANDBOXED
@@ -3136,13 +3240,13 @@ function assertRequiredCommands(commands) {
 
 // Kept for callers/tests that expect a path-or-empty-string answer.
 function findCommandInPath(command) {
-  return findBinary(command);
+  return findBinary(command, process.env);
 }
 
 function runCommand(command, args, options = {}) {
   // Always spawn the absolute path: a packaged .app has a minimal PATH and
   // /opt/homebrew/bin is not in it unless the user's shell is involved.
-  const executable = resolveBinary(command);
+  const executable = resolveBinary(command, process.env);
   return new Promise((resolve, reject) => {
     if (shuttingDown) {
       reject(new Error(`${command} skipped: server is shutting down.`));

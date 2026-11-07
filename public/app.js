@@ -35,6 +35,17 @@ const generateReadingButton = document.querySelector("[data-generate-reading]");
 const readingDownloadButton = document.querySelector("[data-download-reading]");
 const stopButton = document.querySelector("[data-stop]");
 const etaText = document.querySelector("[data-progress-eta]");
+const queuePanel = document.querySelector("[data-task-queue]");
+const queueList = document.querySelector("[data-queue-list]");
+const queueFeedback = document.querySelector("[data-queue-feedback]");
+let queueSupported = false;
+let queueInitialized = !queuePanel;
+let queueSubmitting = false;
+let queueTasks = [];
+let selectedQueueTask = "";
+let queuePoll = null;
+let queueRefreshing = false;
+const queueReady = queuePanel ? refreshTaskQueue(true) : Promise.resolve();
 
 let activeRequest = null;
 let activeJobId = "";
@@ -352,6 +363,8 @@ for (const tab of viewTabs) {
 }
 
 function resetDocument() {
+  const taskHeading = document.querySelector("[data-current-task]");
+  if (taskHeading) taskHeading.hidden = true;
   documentVersion += 1;
   clearStopFallback();
   eta = null;
@@ -641,6 +654,12 @@ stopButton.addEventListener("click", async () => {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+
+  if (!queueInitialized) await queueReady;
+  if (queueSupported) {
+    await enqueueVideo();
+    return;
+  }
 
   const url = urlInput.value.trim();
   if (!url || activeRequest) {
@@ -1004,7 +1023,7 @@ function setBusy(isBusy) {
   submitButton.disabled = isBusy;
   urlInput.disabled = isBusy;
   checkStatusButton.disabled = isBusy;
-  submitButton.textContent = isBusy ? "处理中..." : "提取并转写";
+  submitButton.textContent = queueSupported ? "加入任务队列" : isBusy ? "处理中..." : "提取并转写";
   stopButton.hidden = !isBusy;
   stopButton.disabled = false;
   stopButton.textContent = "停止处理";
@@ -1243,7 +1262,7 @@ checkStatusButton.addEventListener("click", async () => {
   }
 });
 
-async function loadJobStatus({ summaryOnly = false } = {}) {
+async function loadJobStatus({ summaryOnly = false, quiet = false } = {}) {
   syncDocumentUrl();
   const target = documentTarget();
   const requestId = ++historyRequestId;
@@ -1287,15 +1306,135 @@ async function loadJobStatus({ summaryOnly = false } = {}) {
       pendingReadingRequest = followId;
       pollReadingProgress(documentTarget(), followId, { followResult: true });
     }
-    selectTranscriptView("reading");
+    if (!quiet) selectTranscriptView("reading");
     if (transcriptComplete) answerOutput.textContent = "现在可以基于这份文稿提问。";
 
     const next = data.nextResumeChunkHuman ? `下次从第 ${data.nextResumeChunkHuman} 段继续` : "没有待处理片段";
     setStatus(followReading ? "原文已保存，正在同步主题整理进度。" : `本地进度：${data.completedChunks}/${data.totalChunks || 0} 段，${next}。`);
-    addLog(`读取本地进度：${data.completedChunks}/${data.totalChunks || 0} 段。`);
+    if (!quiet) addLog(`读取本地进度：${data.completedChunks}/${data.totalChunks || 0} 段。`);
   } catch (error) {
     if (isCurrentTarget(target) && requestId === historyRequestId) throw error;
   }
+}
+
+async function enqueueVideo() {
+  const url = urlInput.value.trim();
+  if (!url || queueSubmitting) return;
+  queueSubmitting = true;
+  submitButton.disabled = true;
+  submitButton.textContent = "正在获取视频标题…";
+  queueFeedback.textContent = "正在解析视频标题，现有队列会继续处理。";
+  try {
+    const response = await fetch("/api/queue", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "添加任务失败。");
+    queueFeedback.textContent = data.tasks.length === 1
+      ? `${data.duplicates ? "已在队列中" : "已加入队列"}：${data.tasks[0].title}`
+      : `已解析 ${data.tasks.length} 个视频并加入队列${data.duplicates ? `，其中 ${data.duplicates} 个已存在` : ""}。`;
+    if (!selectedQueueTask && data.tasks[0]) selectedQueueTask = data.tasks[0].id;
+    await refreshTaskQueue();
+  } catch (error) {
+    queueFeedback.textContent = `添加失败：${error.message}`;
+  } finally {
+    queueSubmitting = false;
+    submitButton.disabled = false;
+    submitButton.textContent = "加入任务队列";
+  }
+}
+
+async function refreshTaskQueue(initial = false) {
+  if (queueRefreshing) return;
+  queueRefreshing = true;
+  try {
+    const response = await fetch("/api/queue");
+    if (!response.ok) throw new Error("队列暂时不可用");
+    const data = await response.json();
+    if (!Array.isArray(data.tasks)) throw new Error("队列格式错误");
+    queueSupported = true;
+    queuePanel.hidden = false;
+    if (!queueSubmitting) submitButton.textContent = "加入任务队列";
+    queueTasks = data.tasks;
+    renderTaskQueue();
+    const selected = queueTasks.find(task => task.id === selectedQueueTask);
+    if (selected && selected.url === urlInput.value.trim()) {
+      const heading = document.querySelector("[data-current-task]");
+      heading.hidden = false;
+      heading.textContent = selected.title;
+      if (!["queued", "resolving"].includes(selected.state)) {
+        await loadJobStatus({ quiet: true }).catch(() => {});
+      }
+      setStatus(selected.error || selected.message);
+      setStatusKind(selected.state === "failed" ? "error" : selected.state === "complete" ? "success" : selected.state === "cancelled" ? "idle" : "running");
+    }
+  } catch {
+    // Older packaged servers retain the single-task UI. Once the queue is
+    // supported, a temporary connection failure never changes submission mode.
+    if (queueSupported) queueFeedback.textContent = "队列连接暂时中断，正在重试；后台任务会继续。";
+  } finally {
+    if (initial) queueInitialized = true;
+    queueRefreshing = false;
+    if (queueSupported) {
+      clearTimeout(queuePoll);
+      queuePoll = setTimeout(() => refreshTaskQueue(), 1500);
+    }
+  }
+}
+
+function renderTaskQueue() {
+  const labels = { queued: "等待中", resolving: "获取标题", running: "处理中",
+    complete: "已完成", failed: "失败", cancelled: "已停止" };
+  document.querySelector("[data-queue-empty]").hidden = queueTasks.length > 0;
+  const waiting = queueTasks.filter(task => ["queued", "resolving"].includes(task.state)).length;
+  const running = queueTasks.filter(task => task.state === "running").length;
+  document.querySelector("[data-queue-summary]").textContent = `${running} 个处理中 · ${waiting} 个等待 · ${queueTasks.filter(task => task.state === "complete").length} 个已完成`;
+  const rows = queueTasks.map(task => {
+    const row = document.createElement("li");
+    row.className = "task-queue-item";
+    row.dataset.state = task.state;
+    row.dataset.taskId = task.id;
+    const content = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = task.title;
+    content.append(name);
+    const state = document.createElement("p");
+    const progress = task.progress;
+    const counts = progress?.total ? ` · ${progress.completed}/${progress.total} ${progress.stage === "reading" ? "批" : "段"}` : "";
+    state.textContent = `${labels[task.state] || task.state}${counts}${task.error ? ` · ${task.error}` : ""}`;
+    content.append(state);
+    row.append(content);
+    const actions = document.createElement("div");
+    actions.className = "task-queue-actions";
+    const button = (label, action) => {
+      const element = document.createElement("button");
+      element.type = "button";
+      element.className = "secondary-button";
+      element.textContent = label;
+      element.addEventListener("click", action);
+      actions.append(element);
+    };
+    button("查看文稿", async () => {
+      selectedQueueTask = task.id;
+      urlInput.value = task.url;
+      syncDocumentUrl();
+      activeJobId = task.jobId;
+      await refreshTaskQueue();
+    });
+    if (["queued", "resolving", "running"].includes(task.state)) button(task.state === "queued" ? "取消" : "停止", () => queueTaskAction(task, "cancel"));
+    if (["failed", "cancelled"].includes(task.state)) button("继续处理", () => queueTaskAction(task, "retry"));
+    row.append(actions);
+    return row;
+  });
+  queueList.replaceChildren(...rows);
+}
+
+async function queueTaskAction(task, action) {
+  try {
+    const response = await fetch(`/api/queue/${encodeURIComponent(task.id)}/${action}`, { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "操作失败。");
+    await refreshTaskQueue();
+  } catch (error) { queueFeedback.textContent = error.message; }
 }
 
 function updateJobSummary(data) {

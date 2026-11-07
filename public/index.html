@@ -23,9 +23,18 @@
           </div>
           <button class="secondary-button" data-check-status type="button">读取本地进度</button>
           <p class="hint">音频、分段和文稿保存在本机 <code>jobs/&lt;hash&gt;/</code> 目录下。仅识别声音，不包含画面文字；平台没有独立音轨时会提取含声音的视频。</p>
+          <p class="hint" data-queue-feedback role="status" aria-live="polite"></p>
         </form>
 
+        <section class="panel task-queue-panel" data-task-queue hidden aria-label="任务队列">
+          <div class="panel-heading"><h2>任务队列</h2><span data-queue-summary></span></div>
+          <p class="hint">按添加顺序处理，可继续添加链接。任务会保存在本机；关闭窗口后继续处理，退出应用后下次启动继续。</p>
+          <p class="hint" data-queue-empty>还没有任务，添加视频链接即可开始。</p>
+          <ol class="task-queue-list" data-queue-list></ol>
+        </section>
+
         <section class="panel status-panel" aria-label="处理状态" data-status-panel data-status-kind="idle">
+          <h2 data-current-task hidden></h2>
           <div class="status-row">
             <span data-status>等待提交视频链接。</span>
             <span class="status-dot" aria-hidden="true"></span>

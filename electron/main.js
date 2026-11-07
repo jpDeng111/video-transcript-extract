@@ -236,8 +236,19 @@ function registerNotificationIpc() {
 }
 
 app.setName(APP_NAME);
+const ownsInstance = app.requestSingleInstanceLock();
+if (!ownsInstance) app.quit();
+app.on("second-instance", () => {
+  if (!mainWindow && serverInfo) createWindow(serverInfo.url);
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
 
 app.whenReady().then(async () => {
+  if (!ownsInstance) return;
   try {
     const info = await startLocalServer();
     if (process.platform === "darwin") {
@@ -256,6 +267,11 @@ app.on("activate", () => {
   if (!mainWindow && serverInfo) {
     createWindow(serverInfo.url);
   }
+});
+
+app.on("window-all-closed", () => {
+  // Closing the Mac window detaches the view; queued jobs keep running.
+  if (process.platform !== "darwin") app.quit();
 });
 
 app.on("before-quit", async (event) => {

@@ -385,6 +385,23 @@ test('reading API, persistence, downloads and automatic pipelines', async t => {
       assert.equal(stages.filter(event => event.stage === 'reading').at(-1).percent, 100);
     }
   });
+  await t.test('persistent queue expands playlist titles and runs the real audio pipeline', async () => {
+    const response = await post('/api/queue', { url: 'https://example.com/queue-playlist' });
+    assert.equal(response.status, 200);
+    const added = await response.json();
+    assert.deepEqual(added.tasks.map(task => task.title), ['测试视频1', '测试视频2']);
+    const deadline = Date.now() + 5000;
+    let tasks;
+    do {
+      tasks = (await (await fetch(base + '/api/queue')).json()).tasks;
+      if (tasks.every(task => task.state === 'complete')) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    } while (Date.now() < deadline);
+    assert.equal(tasks.length, 2);
+    assert(tasks.every(task => task.state === 'complete'), JSON.stringify(tasks));
+    assert(tasks.every(task => task.title && !task.title.startsWith('https://')));
+    assert.equal(fs.existsSync(path.join(root, 'data/task-queue.json')), true);
+  });
   await t.test('shutdown aborts pending model calls and preserves a retryable state', { timeout: 10000 }, async () => {
     const target = seed('https://example.com/shutdown');
     let release;
