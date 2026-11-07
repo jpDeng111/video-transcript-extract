@@ -512,13 +512,45 @@ function applyReadingState(data) {
   renderReadingState();
 }
 
+// The raw view is a <textarea>, and assigning `.value` throws away its scroll
+// offset and selection. During a running job that fires on every chunk, so the
+// reader kept getting snapped back to the top mid-sentence. Keep them where
+// they were, and only follow the tail when they are already at the bottom.
+function transcriptAtTail(el) {
+  if (el.hidden || el.clientHeight === 0) return false;
+  return el.scrollTop + el.clientHeight >= el.scrollHeight - 32;
+}
+
+function renderTranscript(text) {
+  const el = transcriptOutput;
+  const followTail = transcriptAtTail(el);
+  const previousScroll = el.scrollTop;
+  const selectionStart = el.selectionStart;
+  const selectionEnd = el.selectionEnd;
+  const selectionDirection = el.selectionDirection;
+
+  el.value = text;
+
+  if (followTail) {
+    el.scrollTop = el.scrollHeight;
+    return;
+  }
+
+  el.scrollTop = previousScroll;
+  try {
+    el.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
+  } catch {
+    // A shrinking transcript can invalidate the old offsets; ignoring is fine.
+  }
+}
+
 function completeDocument(event) {
   historyRequestId += 1;
   readingRequestId += 1;
   pendingReadingRequest = 0;
   cancelReadingPolling();
   activeJobId = event.jobId || activeJobId;
-  if (typeof event.transcript === "string") transcriptOutput.value = event.transcript;
+  if (typeof event.transcript === "string") renderTranscript(event.transcript);
   if (event.transcriptPath) transcriptPath.textContent = event.transcriptPath;
   transcriptComplete = Boolean(transcriptOutput.value.trim());
   applyReadingState(event);
@@ -935,7 +967,7 @@ function handleEvent(event) {
   }
 
   if (event.transcript !== undefined) {
-    transcriptOutput.value = event.transcript;
+    renderTranscript(event.transcript);
   }
 
   if (event.transcriptPath) {
@@ -1243,7 +1275,7 @@ async function loadJobStatus({ summaryOnly = false } = {}) {
       }, data.status === "complete");
     }
     if (data.transcriptPath) transcriptPath.textContent = data.transcriptPath;
-    if (typeof data.transcript === "string") transcriptOutput.value = data.transcript;
+    if (typeof data.transcript === "string") renderTranscript(data.transcript);
     // Never substitute transcriptPreview (which may be truncated to 2,000 chars).
     transcriptComplete = Boolean(transcriptOutput.value.trim()) && (data.status === "complete"
       || (data.completedChunks > 0 && data.completedChunks >= (data.totalChunks || 1)));
